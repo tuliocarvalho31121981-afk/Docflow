@@ -4,7 +4,7 @@ import React, { useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   Calendar, Target, MessageCircle, Users, Shield, BarChart3,
-  Search, Settings, Bell, Moon, Sun
+  Search, Settings, Bell, Moon, Sun, FileText, Stethoscope
 } from 'lucide-react';
 import { useAppStore, WALLPAPERS } from '@/lib/store';
 import { cn, getGlassStyles, getTextStyles } from '@/lib/utils';
@@ -52,10 +52,12 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
   if (!user) return null;
 
   const apps = [
+    { icon: Stethoscope, label: 'Cockpit', path: '/dashboard/cockpit', color: 'from-amber-500 to-orange-600' },
     { icon: Calendar, label: 'Agenda', path: '/dashboard/agenda', color: 'from-blue-500 to-blue-600' },
     { icon: Target, label: 'Card', path: '/dashboard/cards', color: 'from-emerald-500 to-green-600', badge: 3 },
     { icon: MessageCircle, label: 'Chat', path: '/dashboard/chat', color: 'from-violet-500 to-purple-600', badge: 5 },
     { icon: Users, label: 'Pacientes', path: '/dashboard/pacientes', color: 'from-orange-500 to-amber-600' },
+    { icon: FileText, label: 'Modelos', path: '/dashboard/modelos-documentos', color: 'from-amber-500 to-yellow-600' },
     { icon: Shield, label: 'Governança', path: '/dashboard/governanca', color: 'from-pink-500 to-rose-600', badge: 8 },
     { icon: BarChart3, label: 'Relatórios', path: '/dashboard/relatorios', color: 'from-cyan-500 to-teal-600' },
   ];

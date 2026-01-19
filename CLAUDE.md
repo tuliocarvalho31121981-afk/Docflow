@@ -1,7 +1,7 @@
 # CLINIC OS (DOCFLOW) - CLAUDE.md
 
 > **Sistema Operacional para Clínicas Médicas**
-> **Versão:** 1.3.0 | **Sprint Atual:** 5 (Fase 0 - Funil de Leads)
+> **Versão:** 1.4.0 | **Sprint Atual:** 6 (Cockpit do Médico)
 > **Última atualização:** Janeiro 2026
 
 ---
@@ -529,26 +529,124 @@ mcp__supabase__list_tables(project_id="xljxypybaiolztdgoxio")
 
 ---
 
+## COCKPIT DO MÉDICO
+
+### Visão Geral
+
+O Cockpit do Médico (`/dashboard/cockpit`) é a tela principal de atendimento, com layout de **4 colunas colapsáveis** + **painel inferior expansível**.
+
+### Layout
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Header: Paciente selecionado + Data/Hora                                │
+├──────────┬─────────────────┬─────────────────┬─────────────────────────┤
+│  Fila    │    Histórico    │  Prontuário     │     Transcrição         │
+│  de      │    do           │  SOAP           │     da Consulta         │
+│  Atend.  │    Paciente     │                 │                         │
+│          │                 │  - Subjetivo    │     [Gravar]            │
+│  [w-72]  │    [flex-1]     │  - Objetivo     │                         │
+│  fixo    │    expande      │  - Avaliação    │     [flex-1]            │
+│          │                 │  - Plano        │     expande             │
+│          │    ← → colapsa  │                 │                         │
+│          │    lateralmente │  [flex-1]       │     ← → colapsa         │
+│          │                 │  expande        │     lateralmente        │
+├──────────┴─────────────────┴─────────────────┴─────────────────────────┤
+│  Exame Físico / Sinais Vitais                    ↑↓ expande vertical   │
+│  PA: 120/80 | FC: 72 | T: 36.5°C | SpO2: 98%                           │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### Colunas Colapsáveis
+
+| Coluna | Largura Expandida | Comportamento |
+|--------|-------------------|---------------|
+| **Fila de Atendimento** | `w-72` (fixa) | Lista pacientes do dia |
+| **Histórico do Paciente** | `flex-1` (expande) | Dados + validação obrigatória |
+| **Prontuário SOAP** | `flex-1` (expande) | Edição do SOAP |
+| **Transcrição** | `flex-1` (expande) | Gravação + texto |
+
+Quando colapsada, cada coluna mostra apenas **ícone + tooltip** no hover.
+
+### Sistema de Validação Obrigatória
+
+O médico **deve confirmar** que revisou as seguintes seções antes de finalizar a consulta:
+
+| Seção | Editável | Validação | Ícone quando pendente |
+|-------|----------|-----------|----------------------|
+| **Alergias** | ✅ | ✅ Obrigatória | ⚠️ Amarelo |
+| **Anamnese** | ✅ | ✅ Obrigatória | ⚠️ Amarelo |
+| **Medicamentos em Uso** | ✅ | ✅ Obrigatória | ⚠️ Amarelo |
+| **Antecedentes** | ✅ | ✅ Obrigatória | ⚠️ Amarelo |
+
+**Fluxo:**
+1. Médico revisa cada seção
+2. Clica no botão ✓ para marcar como "Conferido"
+3. Ícone muda de ⚠️ amarelo para ✅ verde
+4. Só pode finalizar consulta após validar todas as seções
+
+### Modal de Edição
+
+Cada seção editável abre um modal para alteração:
+- **Alergias**: Lista separada por vírgula
+- **Medicamentos**: Um por linha
+- **Antecedentes**: Texto livre
+- **Anamnese**: Queixa principal + observações do médico
+
+### Componentes Principais
+
+| Componente | Arquivo | Função |
+|------------|---------|--------|
+| `ColunaColapsavel` | `cockpit/page.tsx` | Coluna com expansão lateral + tooltip |
+| `PainelExameFisicoInferior` | `cockpit/page.tsx` | Painel inferior com expansão vertical |
+| `PainelPreparado` | `cockpit/page.tsx` | Histórico + validações obrigatórias |
+| `PainelSOAP` | `cockpit/page.tsx` | Editor SOAP com campos editáveis |
+| `SecaoAnamnese` | `cockpit/page.tsx` | Anamnese com validação |
+
+### Estados de Validação
+
+```typescript
+const [validacoes, setValidacoes] = useState({
+  anamnese: false,
+  antecedentes: false,
+  medicamentos: false,
+  alergias: false,
+});
+
+// Verificar se pode finalizar
+const todasValidacoes = Object.values(validacoes).every(v => v);
+```
+
+---
+
 ## STATUS DO PROJETO
 
-### Sprints Concluídas (1-4)
+### Sprints Concluídas (1-5)
 - [x] Backend completo (auth, clínicas, pacientes, agenda, kanban, governança)
 - [x] Frontend com Design Liquid Glass
 - [x] Chat simulador com Groq API
 - [x] Sistema de cards/kanban
-
-### Sprint Atual (5) - Fase 0: Funil de Leads
 - [x] Chat LangGraph implementado
 - [x] Ferramentas do agente
-- [ ] Integração WhatsApp real (Evolution API)
-- [ ] Webhooks funcionais
+
+### Sprint Atual (6) - Cockpit do Médico
+- [x] Layout 4 colunas colapsáveis lateralmente
+- [x] Painel de Exame Físico com expansão vertical
+- [x] Ícone + tooltip quando coluna colapsada
+- [x] Histórico/SOAP/Transcrição expandem (flex-1)
+- [x] Sistema de validação obrigatória (Alergias, Anamnese, Medicamentos, Antecedentes)
+- [x] Botões Editar + Conferi em cada seção
+- [x] Modal de edição para cada seção
+- [x] Bloqueio do Finalizar se não validou tudo
+- [x] Barras de rolagem em todas as colunas
+- [ ] Integração API para salvar edições
+- [ ] Persistir validações no banco
 
 ### Próximas Sprints
-- Sprint 6: Slots de Agenda (configuração por médico)
-- Sprint 7: Prontuário + Transcrição (Whisper)
-- Sprint 8: SOAP automático (Claude)
+- Sprint 7: Integração WhatsApp real (Evolution API)
+- Sprint 8: Transcrição de consultas (Whisper)
+- Sprint 9: SOAP automático (Claude)
 
 ---
 
 **Cliente Piloto:** DAG Serviços Médicos (Tulio Carvalho)
-1

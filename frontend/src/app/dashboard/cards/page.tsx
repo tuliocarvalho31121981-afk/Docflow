@@ -12,8 +12,12 @@ import {
   Calendar,
   ChevronRight,
   X,
-  Target
+  Target,
+  FileText,
+  Download,
+  Printer,
 } from 'lucide-react';
+import { ModeloSelector } from '@/components/modelos';
 import { api, type CardKanbanResponse, type CardResponse, type ChecklistItem as ApiChecklistItem } from '@/lib/api';
 import { useAppStore } from '@/lib/store';
 import { cn, getGlassStyles, getTextStyles } from '@/lib/utils';
@@ -474,7 +478,9 @@ function CardModal({ cardId, onClose, onUpdated }: CardModalProps) {
   const [checklist, setChecklist] = useState<ChecklistItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'detalhes' | 'checklist'>('detalhes');
+  const [activeTab, setActiveTab] = useState<'detalhes' | 'checklist' | 'documentos'>('detalhes');
+  const [showModeloSelector, setShowModeloSelector] = useState(false);
+  const [documentoGerado, setDocumentoGerado] = useState<string | null>(null);
 
   useEffect(() => {
     carregarCard();
@@ -638,6 +644,18 @@ function CardModal({ cardId, onClose, onUpdated }: CardModalProps) {
         >
           Checklist ({checklist.filter(c => c.concluido).length}/{checklist.length})
         </button>
+        <button
+          onClick={() => setActiveTab('documentos')}
+          className={cn(
+            'px-4 py-3 text-sm font-medium border-b-2 transition-colors flex items-center gap-2',
+            activeTab === 'documentos'
+              ? 'border-violet-500 text-violet-400'
+              : cn('border-transparent', text.muted, 'hover:' + text.secondary)
+          )}
+        >
+          <FileText className="w-4 h-4" />
+          Documentos
+        </button>
       </div>
 
       {/* Content */}
@@ -760,7 +778,102 @@ function CardModal({ cardId, onClose, onUpdated }: CardModalProps) {
             )}
           </div>
         )}
+
+        {activeTab === 'documentos' && (
+          <div className="space-y-4">
+            {/* Botão para emitir novo documento */}
+            <button
+              onClick={() => setShowModeloSelector(true)}
+              className={cn(
+                'w-full flex items-center justify-center gap-2 p-4 rounded-xl',
+                'bg-gradient-to-r from-amber-500 to-yellow-600 text-white font-medium',
+                'hover:opacity-90 transition-all'
+              )}
+            >
+              <FileText className="w-5 h-5" />
+              Emitir Documento
+            </button>
+
+            {/* Documento gerado */}
+            {documentoGerado && (
+              <div className={cn(glass.glassStrong, 'rounded-xl p-4')}>
+                <div className="flex items-center justify-between mb-3">
+                  <h4 className={cn('font-medium', text.primary)}>Documento Gerado</h4>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => {
+                        const blob = new Blob([documentoGerado], { type: 'text/plain' });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `documento-${card?.paciente_nome || 'paciente'}.txt`;
+                        a.click();
+                        URL.revokeObjectURL(url);
+                      }}
+                      className={cn(glass.glass, 'p-2 rounded-lg hover:bg-white/20 transition-colors')}
+                      title="Baixar"
+                    >
+                      <Download className="w-4 h-4" />
+                    </button>
+                    <button
+                      onClick={() => {
+                        const printWindow = window.open('', '_blank');
+                        if (printWindow) {
+                          printWindow.document.write(`
+                            <html>
+                              <head><title>Documento</title></head>
+                              <body style="font-family: Arial, sans-serif; padding: 40px; white-space: pre-wrap;">
+                                ${documentoGerado}
+                              </body>
+                            </html>
+                          `);
+                          printWindow.document.close();
+                          printWindow.print();
+                        }
+                      }}
+                      className={cn(glass.glass, 'p-2 rounded-lg hover:bg-white/20 transition-colors')}
+                      title="Imprimir"
+                    >
+                      <Printer className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+                <div className={cn(
+                  'p-4 rounded-lg font-mono text-sm whitespace-pre-wrap max-h-64 overflow-y-auto',
+                  glass.glass,
+                  text.primary
+                )}>
+                  {documentoGerado}
+                </div>
+              </div>
+            )}
+
+            {/* Placeholder quando não há documento */}
+            {!documentoGerado && (
+              <div className={cn('text-center py-8', text.muted)}>
+                <FileText className="w-12 h-12 mx-auto mb-3 opacity-50" />
+                <p>Nenhum documento emitido ainda</p>
+                <p className="text-sm mt-1">Clique em "Emitir Documento" para criar um atestado, receita ou outro documento</p>
+              </div>
+            )}
+          </div>
+        )}
       </div>
+
+      {/* ModeloSelector Modal */}
+      <ModeloSelector
+        isOpen={showModeloSelector}
+        onClose={() => setShowModeloSelector(false)}
+        onSelect={(modelo, conteudoProcessado) => {
+          setDocumentoGerado(conteudoProcessado);
+          setShowModeloSelector(false);
+        }}
+        pacienteData={{
+          nome: card?.paciente_nome,
+          telefone: card?.paciente_telefone,
+        }}
+        titulo="Selecionar Modelo de Documento"
+      />
     </ModalWrapper>
   );
 }
