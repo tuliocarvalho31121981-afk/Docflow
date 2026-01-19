@@ -1,0 +1,113 @@
+# ============================================
+# WORKFLOW: Lembrete D-1
+# ============================================
+# Executa diariamente às 18h
+# Envia lembrete para consultas do dia seguinte
+# ============================================
+
+id: lembrete-d1
+namespace: clinica
+description: Envia lembrete de consulta um dia antes
+
+labels:
+  team: atendimento
+  module: agenda
+  priority: high
+
+tasks:
+  # ----------------------------------------
+  # 1. Calcula data de amanhã
+  # ----------------------------------------
+  - id: calcular_data
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    script: |
+      from datetime import datetime, timedelta
+      
+      amanha = datetime.now() + timedelta(days=1)
+      data_amanha = amanha.strftime("%Y-%m-%d")
+      
+      print(f"::set-output name=data_amanha::{data_amanha}")
+
+  # ----------------------------------------
+  # 2. Busca agendamentos de amanhã
+  # ----------------------------------------
+  - id: buscar_agendamentos
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/agendamentos"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+    queryParams:
+      data: "{{ outputs.calcular_data.vars.data_amanha }}"
+      status: confirmado,agendado
+      enviar_lembrete: "true"
+
+  # ----------------------------------------
+  # 3. Para cada agendamento, envia lembrete
+  # ----------------------------------------
+  - id: enviar_lembretes
+    type: io.kestra.plugin.core.flow.EachSequential
+    value: "{{ outputs.buscar_agendamentos.body.data }}"
+    tasks:
+      # Formata data
+      - id: formatar
+        type: io.kestra.plugin.scripts.python.Script
+        runner: PROCESS
+        script: |
+          from datetime import datetime
+          
+          data_str = "{{ taskrun.value.data }}"
+          data = datetime.strptime(data_str, "%Y-%m-%d")
+          
+          dias = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
+          meses = ["", "jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
+          
+          formatada = f"{dias[data.weekday()]}, {data.day}/{meses[data.month]}"
+          print(f"::set-output name=data_fmt::{formatada}")
+
+      # Envia WhatsApp
+      - id: enviar
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+        method: POST
+        headers:
+          apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "number": "55{{ taskrun.value.paciente.telefone }}",
+            "text": "Olá, {{ taskrun.value.paciente.nome }}! 🔔\n\nLembramos que você tem consulta *amanhã*:\n\n📅 {{ outputs.formatar.vars.data_fmt }}\n⏰ {{ taskrun.value.hora_inicio }}\n👨‍⚕️ {{ taskrun.value.medico.nome }}\n\nConfirme sua presença respondendo *SIM*.\n\nCaso precise remarcar, responda *REMARCAR*."
+          }
+
+      # Registra
+      - id: registrar
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/mensagens"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "clinica_id": "{{ taskrun.value.clinica_id }}",
+            "agendamento_id": "{{ taskrun.value.id }}",
+            "paciente_telefone": "{{ taskrun.value.paciente.telefone }}",
+            "tipo": "lembrete_d1",
+            "direcao": "enviada",
+            "status": "enviada"
+          }
+
+  # ----------------------------------------
+  # 4. Log de conclusão
+  # ----------------------------------------
+  - id: log_conclusao
+    type: io.kestra.plugin.core.log.Log
+    message: "Lembretes D-1 enviados: {{ outputs.buscar_agendamentos.body.meta.total }} agendamentos"
+
+triggers:
+  # Executa todos os dias às 18h (horário de Brasília)
+  - id: diario_18h
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 18 * * *"
+    timezone: America/Sao_Paulo

@@ -1,0 +1,179 @@
+# ============================================================================
+# DocFlow - Cursor AI Rules
+# ============================================================================
+# Este arquivo configura o comportamento do Cursor AI para o projeto DocFlow
+# ============================================================================
+
+## Contexto do Projeto
+
+Este é o projeto DocFlow - Sistema de Gestão de Clínicas Médicas.
+
+### Stack Técnica
+
+**Backend:**
+- Python 3.12 + FastAPI
+- Supabase (PostgreSQL + Auth + Storage)
+- Redis (cache + rate limiting)
+- Kestra (workflow orchestration)
+
+**Frontend:**
+- React 18 + TypeScript
+- Vite
+- TailwindCSS
+- Shadcn/UI
+- React Query (TanStack Query)
+- Zustand (state management)
+
+**Integrações:**
+- Evolution API (WhatsApp)
+- OpenAI Whisper (transcrição de áudio)
+- Anthropic Claude (IA/SOAP)
+
+### Estrutura do Projeto
+
+```
+docflow/
+├── backend/
+│   ├── app/
+│   │   ├── core/           # Config, DB, Auth, Exceptions
+│   │   ├── pacientes/      # Módulo pacientes
+│   │   ├── agenda/         # Módulo agenda
+│   │   ├── cards/          # Módulo Kanban
+│   │   ├── clinicas/       # Módulo multi-tenant
+│   │   ├── evidencias/     # Módulo auditoria
+│   │   ├── prontuario/     # (a criar)
+│   │   ├── financeiro/     # (a criar)
+│   │   ├── webhooks/       # Webhooks WhatsApp
+│   │   └── integracoes/    # Clientes externos
+│   └── tests/
+├── frontend/
+│   ├── src/
+│   │   ├── components/     # Componentes React
+│   │   ├── pages/          # Páginas
+│   │   ├── hooks/          # Custom hooks
+│   │   ├── services/       # API clients
+│   │   ├── stores/         # Zustand stores
+│   │   └── utils/          # Utilitários
+│   └── public/
+└── kestra/
+    └── workflows/          # Workflows YAML
+```
+
+## Diretrizes de Código
+
+### Python (Backend)
+
+1. **Sempre use type hints**
+```python
+async def get_paciente(id: str, clinica_id: str) -> PacienteResponse:
+```
+
+2. **Siga o padrão Service/Router/Schema**
+- `schemas.py` - DTOs Pydantic
+- `service.py` - Lógica de negócio
+- `router.py` - Endpoints FastAPI
+
+3. **Use estrutura async/await**
+```python
+async def list_pacientes(clinica_id: str) -> list[dict]:
+    return await db.select(...)
+```
+
+4. **Logging estruturado com structlog**
+```python
+logger.info("Paciente criado", id=paciente.id, nome=paciente.nome)
+```
+
+5. **Exceptions customizadas**
+```python
+raise NotFoundError("Paciente", paciente_id)
+raise ValidationError("CPF inválido")
+```
+
+### TypeScript (Frontend)
+
+1. **Sempre use TypeScript estrito**
+```typescript
+interface Paciente {
+  id: string;
+  nome: string;
+  telefone: string;
+}
+```
+
+2. **Componentes funcionais com hooks**
+```tsx
+export function PacienteCard({ paciente }: { paciente: Paciente }) {
+  const [isOpen, setIsOpen] = useState(false);
+  // ...
+}
+```
+
+3. **Use React Query para data fetching**
+```typescript
+const { data, isLoading } = useQuery({
+  queryKey: ['pacientes', clinicaId],
+  queryFn: () => pacienteService.list(clinicaId)
+});
+```
+
+4. **Tailwind CSS para estilização**
+```tsx
+<div className="flex items-center gap-4 p-4 rounded-lg bg-white shadow">
+```
+
+5. **Shadcn/UI para componentes base**
+```tsx
+import { Button } from '@/components/ui/button';
+import { Card } from '@/components/ui/card';
+```
+
+### SQL
+
+1. **Use snake_case para tabelas e colunas**
+2. **Sempre inclua clinica_id (multi-tenant)**
+3. **RLS habilitado em todas as tabelas**
+4. **Soft delete com campo `ativo` ou `status`**
+
+## Padrões de Nomenclatura
+
+| Tipo | Padrão | Exemplo |
+|------|--------|---------|
+| Tabela SQL | snake_case | `pacientes_alergias` |
+| Coluna SQL | snake_case | `data_nascimento` |
+| Classe Python | PascalCase | `PacienteService` |
+| Função Python | snake_case | `get_paciente` |
+| Variável Python | snake_case | `clinica_id` |
+| Componente React | PascalCase | `PacienteCard` |
+| Hook React | camelCase | `usePaciente` |
+| Arquivo TypeScript | kebab-case | `paciente-card.tsx` |
+
+## Regras de Negócio Importantes
+
+1. **Multi-tenant**: Todos os dados pertencem a uma clínica
+2. **RLS**: Validação de acesso no banco
+3. **Permissões CLEX**: Create, List, Edit, eXclude
+4. **Evidências**: Ações críticas exigem prova documental
+5. **Audit**: Todas as ações são logadas
+
+## Comandos Úteis
+
+```bash
+make dev           # Inicia backend + frontend
+make test          # Roda testes
+make lint          # Verifica código
+make format        # Formata código
+make docker-up     # Sobe containers
+make kestra-deploy # Deploy workflows
+```
+
+## Ao Gerar Código
+
+1. Siga os padrões existentes no projeto
+2. Inclua type hints em Python
+3. Inclua tipos em TypeScript
+4. Use os componentes Shadcn/UI existentes
+5. Mantenha consistência com o código existente
+6. Adicione logging onde apropriado
+7. Trate erros adequadamente
+8. Considere o multi-tenant (clinica_id)

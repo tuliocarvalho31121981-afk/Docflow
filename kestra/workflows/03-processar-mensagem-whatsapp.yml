@@ -1,0 +1,291 @@
+# ============================================
+# WORKFLOW: Processar Mensagem WhatsApp
+# ============================================
+# Dispara via webhook quando recebe mensagem
+# Interpreta: SIM, CANCELAR, REMARCAR, mídia
+# ============================================
+
+id: processar-mensagem-whatsapp
+namespace: clinica
+description: Processa mensagens recebidas do WhatsApp
+
+labels:
+  team: atendimento
+  module: whatsapp
+  priority: critical
+
+inputs:
+  - id: telefone
+    type: STRING
+    required: true
+    description: Telefone do remetente (sem 55)
+
+  - id: mensagem
+    type: STRING
+    required: false
+    description: Texto da mensagem
+
+  - id: message_id
+    type: STRING
+    required: true
+    description: ID da mensagem no WhatsApp
+
+  - id: tipo_mensagem
+    type: STRING
+    required: true
+    description: "Tipo: text, image, document, audio"
+
+  - id: media_url
+    type: STRING
+    required: false
+    description: URL da mídia (se houver)
+
+  - id: media_mimetype
+    type: STRING
+    required: false
+    description: MIME type da mídia
+
+  - id: quoted_message_id
+    type: STRING
+    required: false
+    description: ID da mensagem sendo respondida
+
+tasks:
+  # ----------------------------------------
+  # 1. Busca paciente pelo telefone
+  # ----------------------------------------
+  - id: buscar_paciente
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/pacientes/by-telefone/{{ inputs.telefone }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+    allowFailure: true
+
+  # ----------------------------------------
+  # 2. Busca agendamento pendente do paciente
+  # ----------------------------------------
+  - id: buscar_agendamento
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/agendamentos/pendente-confirmacao"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+    queryParams:
+      paciente_telefone: "{{ inputs.telefone }}"
+    allowFailure: true
+
+  # ----------------------------------------
+  # 3. Decide ação baseado no conteúdo
+  # ----------------------------------------
+  - id: decidir_acao
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    script: |
+      import re
+      
+      tipo = "{{ inputs.tipo_mensagem }}"
+      mensagem = "{{ inputs.mensagem }}".strip().upper() if "{{ inputs.mensagem }}" else ""
+      tem_agendamento = {{ outputs.buscar_agendamento.body.data is defined and outputs.buscar_agendamento.body.data | length > 0 }}
+      
+      acao = "ignorar"
+      
+      if tipo in ["image", "document"]:
+          acao = "processar_midia"
+      elif tipo == "audio":
+          acao = "processar_audio"
+      elif tipo == "text":
+          # Normaliza resposta
+          if mensagem in ["SIM", "S", "CONFIRMO", "CONFIRMADO", "OK", "1"]:
+              acao = "confirmar"
+          elif mensagem in ["NAO", "NÃO", "N", "CANCELAR", "CANCELA", "CANCELADO", "2"]:
+              acao = "cancelar"
+          elif mensagem in ["REMARCAR", "REAGENDAR", "3"]:
+              acao = "remarcar"
+          elif tem_agendamento:
+              acao = "salvar_observacao"
+          else:
+              acao = "resposta_padrao"
+      
+      print(f"::set-output name=acao::{acao}")
+
+  # ----------------------------------------
+  # 4. Executa ação de CONFIRMAR
+  # ----------------------------------------
+  - id: acao_confirmar
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.decidir_acao.vars.acao == 'confirmar' }}"
+    then:
+      - id: confirmar_agendamento
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/agendamentos/{{ outputs.buscar_agendamento.body.data[0].id }}/status"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "status": "confirmado",
+            "confirmado_via": "whatsapp"
+          }
+
+      - id: responder_confirmacao
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+        method: POST
+        headers:
+          apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "number": "55{{ inputs.telefone }}",
+            "text": "✅ Consulta confirmada!\n\nAguardamos você no dia e horário marcados.\n\nLembre-se de trazer seus documentos e exames, se houver."
+          }
+
+  # ----------------------------------------
+  # 5. Executa ação de CANCELAR
+  # ----------------------------------------
+  - id: acao_cancelar
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.decidir_acao.vars.acao == 'cancelar' }}"
+    then:
+      - id: cancelar_agendamento
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/agendamentos/{{ outputs.buscar_agendamento.body.data[0].id }}/status"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "status": "cancelado",
+            "cancelado_via": "whatsapp",
+            "motivo_cancelamento": "Solicitado pelo paciente via WhatsApp"
+          }
+
+      - id: responder_cancelamento
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+        method: POST
+        headers:
+          apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "number": "55{{ inputs.telefone }}",
+            "text": "❌ Consulta cancelada.\n\nSe precisar, entre em contato para reagendar.\n\nEstamos à disposição!"
+          }
+
+  # ----------------------------------------
+  # 6. Executa ação de REMARCAR
+  # ----------------------------------------
+  - id: acao_remarcar
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.decidir_acao.vars.acao == 'remarcar' }}"
+    then:
+      - id: responder_remarcar
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+        method: POST
+        headers:
+          apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "number": "55{{ inputs.telefone }}",
+            "text": "📅 Para remarcar sua consulta, por favor entre em contato com nossa recepção:\n\n📞 (11) 3333-4444\n\nOu acesse nosso site para ver horários disponíveis."
+          }
+
+      - id: alerta_remarcar
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/alertas"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "clinica_id": "{{ outputs.buscar_agendamento.body.data[0].clinica_id }}",
+            "tipo": "remarcacao_solicitada",
+            "titulo": "Paciente solicitou remarcação",
+            "mensagem": "{{ outputs.buscar_paciente.body.data.nome }} solicitou remarcar consulta via WhatsApp",
+            "referencia_tipo": "agendamento",
+            "referencia_id": "{{ outputs.buscar_agendamento.body.data[0].id }}"
+          }
+
+  # ----------------------------------------
+  # 7. Processa MÍDIA (exame/documento)
+  # ----------------------------------------
+  - id: acao_processar_midia
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.decidir_acao.vars.acao == 'processar_midia' }}"
+    then:
+      # Dispara workflow de processamento de exame
+      - id: processar_exame
+        type: io.kestra.plugin.core.flow.Subflow
+        flowId: processar-exame-whatsapp
+        namespace: clinica
+        inputs:
+          paciente_telefone: "{{ inputs.telefone }}"
+          media_url: "{{ inputs.media_url }}"
+          media_mimetype: "{{ inputs.media_mimetype }}"
+          message_id: "{{ inputs.message_id }}"
+        wait: false
+
+      - id: responder_midia
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+        method: POST
+        headers:
+          apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "number": "55{{ inputs.telefone }}",
+            "text": "📎 Documento recebido!\n\nEstamos processando e vinculando ao seu prontuário.\n\nObrigado pelo envio!"
+          }
+
+  # ----------------------------------------
+  # 8. Resposta padrão (não entendeu)
+  # ----------------------------------------
+  - id: acao_resposta_padrao
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.decidir_acao.vars.acao == 'resposta_padrao' }}"
+    then:
+      - id: responder_padrao
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+        method: POST
+        headers:
+          apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "number": "55{{ inputs.telefone }}",
+            "text": "Olá! 👋\n\nNão consegui entender sua mensagem.\n\nSe você tem uma consulta agendada, responda:\n• *SIM* para confirmar\n• *CANCELAR* para cancelar\n\nPara falar com nossa equipe:\n📞 (11) 3333-4444"
+          }
+
+  # ----------------------------------------
+  # 9. Registra mensagem recebida
+  # ----------------------------------------
+  - id: registrar_mensagem
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/mensagens"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "paciente_telefone": "{{ inputs.telefone }}",
+        "tipo": "{{ inputs.tipo_mensagem }}",
+        "direcao": "recebida",
+        "conteudo": "{{ inputs.mensagem }}",
+        "message_id": "{{ inputs.message_id }}",
+        "acao_executada": "{{ outputs.decidir_acao.vars.acao }}"
+      }
+
+triggers:
+  - id: webhook_whatsapp
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "whatsapp-message-received"

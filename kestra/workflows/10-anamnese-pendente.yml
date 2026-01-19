@@ -1,0 +1,126 @@
+# ============================================
+# WORKFLOW: Anamnese Pendente
+# ============================================
+# Executa diariamente às 10h
+# Envia link de anamnese para consultas D-3
+# ============================================
+
+id: anamnese-pendente
+namespace: clinica
+description: Envia link de anamnese 3 dias antes da consulta
+
+labels:
+  team: atendimento
+  module: anamnese
+  priority: medium
+
+tasks:
+  # ----------------------------------------
+  # 1. Calcula data D+3
+  # ----------------------------------------
+  - id: calcular_data
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    script: |
+      from datetime import datetime, timedelta
+      
+      data_alvo = datetime.now() + timedelta(days=3)
+      data_str = data_alvo.strftime("%Y-%m-%d")
+      
+      print(f"::set-output name=data_alvo::{data_str}")
+
+  # ----------------------------------------
+  # 2. Busca agendamentos sem anamnese
+  # ----------------------------------------
+  - id: buscar_agendamentos
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/agendamentos"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+    queryParams:
+      data: "{{ outputs.calcular_data.vars.data_alvo }}"
+      status: agendado,confirmado
+      anamnese_preenchida: "false"
+
+  # ----------------------------------------
+  # 3. Para cada, envia link da anamnese
+  # ----------------------------------------
+  - id: enviar_links
+    type: io.kestra.plugin.core.flow.EachSequential
+    value: "{{ outputs.buscar_agendamentos.body.data }}"
+    tasks:
+      # Gera token único para anamnese
+      - id: gerar_token
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/anamnese/token"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "agendamento_id": "{{ taskrun.value.id }}",
+            "paciente_id": "{{ taskrun.value.paciente.id }}",
+            "validade_horas": 72
+          }
+
+      # Envia WhatsApp
+      - id: enviar_whatsapp
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+        method: POST
+        headers:
+          apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "number": "55{{ taskrun.value.paciente.telefone }}",
+            "text": "Olá, {{ taskrun.value.paciente.nome }}! 📝\n\nPara agilizar seu atendimento, pedimos que preencha a anamnese antes da consulta.\n\nLeva apenas 5 minutos:\n👉 {{ secret('FRONTEND_URL') }}/anamnese/{{ outputs.gerar_token.body.data.token }}\n\nEsse link é válido por 72 horas.\n\nObrigado!"
+          }
+
+      # Registra envio
+      - id: registrar
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/mensagens"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "clinica_id": "{{ taskrun.value.clinica_id }}",
+            "agendamento_id": "{{ taskrun.value.id }}",
+            "paciente_telefone": "{{ taskrun.value.paciente.telefone }}",
+            "tipo": "anamnese_link",
+            "direcao": "enviada",
+            "status": "enviada"
+          }
+
+      # Atualiza card
+      - id: atualizar_card
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/cards/by-agendamento/{{ taskrun.value.id }}/checklist/anamnese_enviada"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "concluido": true,
+            "automatico": true
+          }
+
+  # ----------------------------------------
+  # 4. Log de conclusão
+  # ----------------------------------------
+  - id: log_conclusao
+    type: io.kestra.plugin.core.log.Log
+    message: "Links de anamnese enviados: {{ outputs.buscar_agendamentos.body.meta.total }} pacientes"
+
+triggers:
+  # Executa todos os dias às 10h
+  - id: diario_10h
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 10 * * *"
+    timezone: America/Sao_Paulo

@@ -1,0 +1,131 @@
+# ============================================
+# WORKFLOW: Marcar Falta
+# ============================================
+# Executa a cada hora durante horário comercial
+# Marca como falta agendamentos não atendidos
+# Libera slot e notifica
+# ============================================
+
+id: marcar-falta
+namespace: clinica
+description: Marca automaticamente faltas de pacientes
+
+labels:
+  team: atendimento
+  module: agenda
+  priority: medium
+
+tasks:
+  # ----------------------------------------
+  # 1. Busca agendamentos atrasados
+  # ----------------------------------------
+  - id: buscar_atrasados
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    script: |
+      from datetime import datetime, timedelta
+      
+      agora = datetime.now()
+      
+      # Considera falta se passou mais de 30 minutos do horário
+      limite = agora - timedelta(minutes=30)
+      
+      data_hoje = agora.strftime("%Y-%m-%d")
+      hora_limite = limite.strftime("%H:%M")
+      
+      print(f"::set-output name=data_hoje::{data_hoje}")
+      print(f"::set-output name=hora_limite::{hora_limite}")
+
+  - id: buscar_agendamentos
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/agendamentos/atrasados"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+    queryParams:
+      data: "{{ outputs.buscar_atrasados.vars.data_hoje }}"
+      hora_limite: "{{ outputs.buscar_atrasados.vars.hora_limite }}"
+      status: confirmado
+
+  # ----------------------------------------
+  # 2. Para cada, marca como falta
+  # ----------------------------------------
+  - id: marcar_faltas
+    type: io.kestra.plugin.core.flow.EachSequential
+    value: "{{ outputs.buscar_agendamentos.body.data }}"
+    tasks:
+      # Atualiza status
+      - id: atualizar_status
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/agendamentos/{{ taskrun.value.id }}/status"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "status": "faltou",
+            "automatico": true,
+            "motivo": "Paciente não compareceu após 30 minutos do horário"
+          }
+
+      # Envia WhatsApp pro paciente
+      - id: notificar_paciente
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+        method: POST
+        headers:
+          apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "number": "55{{ taskrun.value.paciente.telefone }}",
+            "text": "Olá, {{ taskrun.value.paciente.nome }}.\n\nNotamos que você não compareceu à consulta agendada para hoje às {{ taskrun.value.hora_inicio }}.\n\nCaso tenha tido algum imprevisto, entre em contato para reagendar:\n📞 (11) 3333-4444\n\nEstamos à disposição!"
+          }
+
+      # Notifica equipe
+      - id: notificar_equipe
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/notificacoes/broadcast"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "clinica_id": "{{ taskrun.value.clinica_id }}",
+            "perfil_filtro": ["recepcao", "medico"],
+            "tipo": "paciente_faltou",
+            "titulo": "Paciente faltou",
+            "mensagem": "{{ taskrun.value.paciente.nome }} não compareceu à consulta das {{ taskrun.value.hora_inicio }}",
+            "referencia_tipo": "agendamento",
+            "referencia_id": "{{ taskrun.value.id }}"
+          }
+
+      # Atualiza card
+      - id: atualizar_card
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/cards/by-agendamento/{{ taskrun.value.id }}"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "status": "cancelado",
+            "motivo_cancelamento": "Paciente faltou"
+          }
+
+  # ----------------------------------------
+  # 3. Log de conclusão
+  # ----------------------------------------
+  - id: log_conclusao
+    type: io.kestra.plugin.core.log.Log
+    message: "Faltas marcadas: {{ outputs.buscar_agendamentos.body.data | length }}"
+
+triggers:
+  # Executa a cada hora das 8h às 20h
+  - id: horario_comercial
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 8-20 * * 1-6"  # Seg-Sab, 8h-20h
+    timezone: America/Sao_Paulo

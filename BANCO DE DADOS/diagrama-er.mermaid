@@ -1,0 +1,789 @@
+erDiagram
+    %% ============================================
+    %% FASE 1: FUNDAÇÃO
+    %% ============================================
+    
+    clinicas {
+        uuid id PK
+        string nome
+        string cnpj UK
+        string telefone
+        string email
+        string endereco
+        string cidade
+        string uf
+        string cep
+        string fuso_horario
+        string logo_url
+        decimal saldo_minimo_alerta
+        boolean ativo
+        timestamp created_at
+    }
+    
+    perfis {
+        uuid id PK
+        uuid clinica_id FK
+        string nome
+        string descricao
+        jsonb permissoes
+        boolean is_admin
+        boolean is_medico
+        boolean is_sistema
+        timestamp created_at
+    }
+    
+    users {
+        uuid id PK
+        uuid clinica_id FK
+        uuid perfil_id FK
+        string nome
+        string email UK
+        string telefone
+        string crm
+        string coren
+        string especialidade
+        jsonb horario_acesso
+        jsonb dias_acesso
+        string status
+        timestamp created_at
+        timestamp updated_at
+    }
+    
+    pacientes {
+        uuid id PK
+        uuid clinica_id FK
+        string nome
+        string cpf UK
+        date data_nascimento
+        string sexo
+        string telefone
+        string email
+        string endereco
+        string cidade
+        string uf
+        string cep
+        string tipo_sanguineo
+        string emergencia_contato
+        string como_conheceu
+        uuid indicado_por FK
+        string status
+        timestamp created_at
+        timestamp updated_at
+    }
+    
+    pacientes_alergias {
+        uuid id PK
+        uuid paciente_id FK
+        string substancia
+        string tipo
+        string gravidade
+        string reacao
+        boolean confirmada
+        uuid confirmada_por FK
+        timestamp created_at
+    }
+    
+    pacientes_medicamentos {
+        uuid id PK
+        uuid paciente_id FK
+        string nome
+        string principio_ativo
+        string dosagem
+        string posologia
+        string motivo
+        boolean uso_continuo
+        timestamp created_at
+    }
+    
+    clinicas ||--o{ perfis : "tem"
+    clinicas ||--o{ users : "tem"
+    clinicas ||--o{ pacientes : "tem"
+    perfis ||--o{ users : "define"
+    pacientes ||--o{ pacientes_alergias : "tem"
+    pacientes ||--o{ pacientes_medicamentos : "usa"
+    users ||--o{ pacientes_alergias : "confirma"
+    pacientes ||--o| pacientes : "indica"
+    
+    %% ============================================
+    %% FASE 2: AGENDA
+    %% ============================================
+    
+    tipos_consulta {
+        uuid id PK
+        uuid clinica_id FK
+        string nome
+        integer duracao_minutos
+        decimal valor_particular
+        string cor
+        boolean permite_encaixe
+        integer antecedencia_minima
+        integer antecedencia_maxima
+        boolean ativo
+        timestamp created_at
+    }
+    
+    horarios_disponiveis {
+        uuid id PK
+        uuid clinica_id FK
+        uuid medico_id FK
+        integer dia_semana
+        time hora_inicio
+        time hora_fim
+        integer intervalo_minutos
+        integer vagas_por_horario
+        boolean ativo
+        timestamp created_at
+    }
+    
+    bloqueios_agenda {
+        uuid id PK
+        uuid clinica_id FK
+        uuid medico_id FK
+        date data_inicio
+        date data_fim
+        time hora_inicio
+        time hora_fim
+        string motivo
+        string tipo
+        boolean recorrente_anual
+        timestamp created_at
+    }
+    
+    convenios {
+        uuid id PK
+        uuid clinica_id FK
+        string nome
+        string codigo_ans
+        string telefone
+        integer prazo_envio_guias_dias
+        integer prazo_pagamento_dias
+        decimal valor_consulta
+        boolean ativo
+        timestamp created_at
+    }
+    
+    pacientes_convenios {
+        uuid id PK
+        uuid paciente_id FK
+        uuid convenio_id FK
+        string numero_carteirinha
+        string plano
+        date data_validade
+        boolean principal
+        timestamp created_at
+    }
+    
+    agendamentos {
+        uuid id PK
+        uuid clinica_id FK
+        uuid paciente_id FK
+        uuid medico_id FK
+        uuid tipo_consulta_id FK
+        uuid convenio_id FK
+        date data
+        time hora_inicio
+        time hora_fim
+        string forma_pagamento
+        decimal valor_previsto
+        string status
+        timestamp confirmado_em
+        timestamp checkin_em
+        timestamp chamado_em
+        timestamp finalizado_em
+        string observacoes
+        uuid created_by_user FK
+        boolean created_by_paciente
+        timestamp created_at
+        timestamp updated_at
+    }
+    
+    agendamentos_historico {
+        uuid id PK
+        uuid agendamento_id FK
+        string status_anterior
+        string status_novo
+        uuid alterado_por FK
+        string motivo
+        timestamp created_at
+    }
+    
+    clinicas ||--o{ tipos_consulta : "tem"
+    clinicas ||--o{ horarios_disponiveis : "tem"
+    clinicas ||--o{ bloqueios_agenda : "tem"
+    clinicas ||--o{ convenios : "aceita"
+    clinicas ||--o{ agendamentos : "tem"
+    users ||--o{ horarios_disponiveis : "define"
+    users ||--o{ bloqueios_agenda : "bloqueia"
+    pacientes ||--o{ pacientes_convenios : "tem"
+    convenios ||--o{ pacientes_convenios : "vincula"
+    pacientes ||--o{ agendamentos : "agenda"
+    users ||--o{ agendamentos : "atende"
+    tipos_consulta ||--o{ agendamentos : "tipo"
+    convenios ||--o{ agendamentos : "paga"
+    agendamentos ||--o{ agendamentos_historico : "historico"
+    
+    %% ============================================
+    %% FASE 3: CARDS (KANBAN)
+    %% ============================================
+    
+    cards {
+        uuid id PK
+        uuid clinica_id FK
+        uuid agendamento_id FK
+        uuid paciente_id FK
+        uuid medico_id FK
+        integer fase
+        string coluna
+        integer posicao
+        string status
+        timestamp fase0_em
+        timestamp fase1_em
+        timestamp fase2_em
+        timestamp fase3_em
+        timestamp concluido_em
+        boolean is_derivado
+        uuid card_origem_id FK
+        uuid card_derivado_id FK
+        string paciente_nome
+        string paciente_telefone
+        date data_agendamento
+        timestamp created_at
+        timestamp updated_at
+    }
+    
+    cards_checklist {
+        uuid id PK
+        uuid card_id FK
+        integer fase
+        string tipo
+        string descricao
+        boolean obrigatorio
+        boolean concluido
+        timestamp concluido_em
+        uuid concluido_por FK
+        string referencia_tipo
+        uuid referencia_id
+        timestamp created_at
+    }
+    
+    cards_documentos {
+        uuid id PK
+        uuid card_id FK
+        string tipo
+        string nome
+        string storage_path
+        string mime_type
+        integer tamanho_bytes
+        string exame_tipo
+        date exame_data
+        string exame_laboratorio
+        uuid exame_solicitado_id FK
+        string match_status
+        timestamp created_at
+    }
+    
+    cards_mensagens {
+        uuid id PK
+        uuid card_id FK
+        string direcao
+        string tipo
+        text conteudo
+        string template_nome
+        string status_entrega
+        timestamp created_at
+    }
+    
+    cards_historico {
+        uuid id PK
+        uuid card_id FK
+        string acao
+        integer fase_anterior
+        integer fase_nova
+        string coluna_anterior
+        string coluna_nova
+        string status_anterior
+        string status_novo
+        jsonb detalhes
+        uuid alterado_por FK
+        timestamp created_at
+    }
+    
+    anamneses {
+        uuid id PK
+        uuid clinica_id FK
+        uuid card_id FK
+        uuid paciente_id FK
+        text queixa_principal
+        string duracao_sintomas
+        text doencas_cronicas
+        text cirurgias_previas
+        jsonb historico_familiar
+        boolean fumante
+        boolean etilista
+        string atividade_fisica
+        text medicamentos_atuais
+        timestamp created_at
+        timestamp updated_at
+    }
+    
+    agendamentos ||--|| cards : "gera"
+    cards ||--o{ cards_checklist : "tem"
+    cards ||--o{ cards_documentos : "anexa"
+    cards ||--o{ cards_mensagens : "comunica"
+    cards ||--o{ cards_historico : "registra"
+    cards ||--o| cards : "deriva"
+    cards ||--o| anamneses : "preenche"
+    pacientes ||--o{ anamneses : "responde"
+    
+    %% ============================================
+    %% FASE 4: PRONTUÁRIO
+    %% ============================================
+    
+    consultas {
+        uuid id PK
+        uuid clinica_id FK
+        uuid agendamento_id FK
+        uuid card_id FK
+        uuid paciente_id FK
+        uuid medico_id FK
+        timestamp iniciada_em
+        timestamp finalizada_em
+        integer duracao_minutos
+        string status
+        string tipo
+        text resumo
+        timestamp created_at
+        timestamp updated_at
+    }
+    
+    transcricoes {
+        uuid id PK
+        uuid consulta_id FK
+        string audio_storage_path
+        integer audio_duracao_segundos
+        text transcricao_bruta
+        text transcricao_revisada
+        string status
+        string modelo_whisper
+        string idioma
+        timestamp created_at
+    }
+    
+    prontuarios_soap {
+        uuid id PK
+        uuid clinica_id FK
+        uuid consulta_id FK
+        uuid paciente_id FK
+        uuid medico_id FK
+        text subjetivo
+        text objetivo
+        text avaliacao
+        text plano
+        jsonb exame_fisico
+        jsonb cids
+        boolean gerado_por_ia
+        boolean revisado_por_medico
+        boolean assinado
+        timestamp assinado_em
+        timestamp created_at
+        timestamp updated_at
+    }
+    
+    receitas {
+        uuid id PK
+        uuid clinica_id FK
+        uuid consulta_id FK
+        uuid paciente_id FK
+        uuid medico_id FK
+        string tipo
+        jsonb itens
+        string status
+        boolean assinatura_digital
+        string pdf_storage_path
+        boolean enviada_paciente
+        timestamp created_at
+        timestamp updated_at
+    }
+    
+    atestados {
+        uuid id PK
+        uuid clinica_id FK
+        uuid consulta_id FK
+        uuid paciente_id FK
+        uuid medico_id FK
+        string tipo
+        text texto
+        date data_inicio
+        date data_fim
+        integer dias_afastamento
+        string cid_codigo
+        boolean incluir_cid
+        string status
+        string pdf_storage_path
+        timestamp created_at
+        timestamp updated_at
+    }
+    
+    exames_solicitados {
+        uuid id PK
+        uuid clinica_id FK
+        uuid consulta_id FK
+        uuid paciente_id FK
+        uuid medico_id FK
+        string codigo_tuss
+        string nome
+        string tipo
+        text indicacao_clinica
+        string cid_codigo
+        boolean urgente
+        boolean para_retorno
+        integer prazo_dias
+        string status
+        uuid documento_id FK
+        timestamp created_at
+        timestamp updated_at
+    }
+    
+    encaminhamentos {
+        uuid id PK
+        uuid clinica_id FK
+        uuid consulta_id FK
+        uuid paciente_id FK
+        uuid medico_id FK
+        string especialidade
+        string profissional_nome
+        text motivo
+        string cid_codigo
+        boolean urgente
+        timestamp created_at
+    }
+    
+    agendamentos ||--|| consultas : "gera"
+    cards ||--|| consultas : "vincula"
+    consultas ||--o| transcricoes : "transcreve"
+    consultas ||--|| prontuarios_soap : "documenta"
+    consultas ||--o{ receitas : "prescreve"
+    consultas ||--o{ atestados : "atesta"
+    consultas ||--o{ exames_solicitados : "solicita"
+    consultas ||--o{ encaminhamentos : "encaminha"
+    pacientes ||--o{ consultas : "realiza"
+    users ||--o{ consultas : "atende"
+    
+    %% ============================================
+    %% FASE 5: FINANCEIRO
+    %% ============================================
+    
+    categorias_financeiras {
+        uuid id PK
+        uuid clinica_id FK
+        string nome
+        string tipo
+        uuid categoria_pai_id FK
+        string grupo_dre
+        string cor
+        boolean ativo
+        boolean is_sistema
+        timestamp created_at
+    }
+    
+    fornecedores {
+        uuid id PK
+        uuid clinica_id FK
+        string nome
+        string nome_fantasia
+        string tipo_pessoa
+        string cpf_cnpj
+        string telefone
+        string email
+        string banco
+        string agencia
+        string conta
+        string pix
+        uuid categoria_padrao_id FK
+        boolean ativo
+        timestamp created_at
+    }
+    
+    contas_pagar {
+        uuid id PK
+        uuid clinica_id FK
+        string descricao
+        uuid fornecedor_id FK
+        uuid categoria_id FK
+        decimal valor
+        decimal valor_pago
+        date data_emissao
+        date data_vencimento
+        date data_pagamento
+        boolean recorrente
+        string recorrencia_tipo
+        string documento_tipo
+        string documento_storage_path
+        string codigo_barras
+        jsonb dados_ia
+        string status
+        boolean requer_aprovacao
+        uuid aprovado_por FK
+        timestamp aprovado_em
+        string forma_pagamento
+        string comprovante_storage_path
+        boolean conciliado
+        uuid conciliacao_id FK
+        uuid created_by FK
+        timestamp created_at
+        timestamp updated_at
+    }
+    
+    contas_receber {
+        uuid id PK
+        uuid clinica_id FK
+        string origem
+        uuid consulta_id FK
+        uuid paciente_id FK
+        uuid convenio_id FK
+        string descricao
+        uuid categoria_id FK
+        decimal valor
+        decimal valor_recebido
+        decimal desconto
+        date data_emissao
+        date data_vencimento
+        date data_recebimento
+        string guia_numero
+        string status
+        string forma_pagamento
+        boolean cobranca_enviada
+        integer cobranca_quantidade
+        boolean conciliado
+        uuid created_by FK
+        timestamp created_at
+        timestamp updated_at
+    }
+    
+    contas_pagar_aprovacoes {
+        uuid id PK
+        uuid conta_pagar_id FK
+        string acao
+        uuid usuario_id FK
+        text comentario
+        timestamp created_at
+    }
+    
+    contas_bancarias {
+        uuid id PK
+        uuid clinica_id FK
+        string banco_codigo
+        string banco_nome
+        string agencia
+        string conta
+        string tipo
+        string apelido
+        decimal saldo_atual
+        timestamp saldo_atualizado_em
+        boolean integracao_ativa
+        boolean principal
+        boolean ativo
+        timestamp created_at
+    }
+    
+    extrato_bancario {
+        uuid id PK
+        uuid conta_bancaria_id FK
+        date data
+        string descricao
+        string tipo
+        decimal valor
+        string id_transacao_banco
+        boolean conciliado
+        uuid conciliacao_id FK
+        uuid conta_pagar_id FK
+        uuid conta_receber_id FK
+        uuid categoria_sugerida_id FK
+        timestamp importado_em
+    }
+    
+    conciliacoes {
+        uuid id PK
+        uuid clinica_id FK
+        uuid extrato_id FK
+        uuid conta_pagar_id FK
+        uuid conta_receber_id FK
+        string tipo
+        uuid conciliado_por FK
+        timestamp conciliado_em
+        text observacao
+    }
+    
+    clinicas ||--o{ categorias_financeiras : "tem"
+    clinicas ||--o{ fornecedores : "cadastra"
+    clinicas ||--o{ contas_pagar : "paga"
+    clinicas ||--o{ contas_receber : "recebe"
+    clinicas ||--o{ contas_bancarias : "possui"
+    fornecedores ||--o{ contas_pagar : "fornece"
+    categorias_financeiras ||--o{ contas_pagar : "classifica"
+    categorias_financeiras ||--o{ contas_receber : "classifica"
+    categorias_financeiras ||--o| categorias_financeiras : "pai"
+    consultas ||--o{ contas_receber : "gera"
+    convenios ||--o{ contas_receber : "paga"
+    contas_pagar ||--o{ contas_pagar_aprovacoes : "aprova"
+    contas_bancarias ||--o{ extrato_bancario : "importa"
+    extrato_bancario ||--o| conciliacoes : "concilia"
+    
+    %% ============================================
+    %% FASE 6: AUDITORIA
+    %% ============================================
+    
+    audit_logs {
+        uuid id PK
+        uuid clinica_id
+        uuid user_id
+        string user_nome
+        string user_perfil
+        uuid paciente_id
+        inet ip_address
+        text user_agent
+        string acao
+        string modulo
+        string entidade
+        uuid entidade_id
+        jsonb dados_anteriores
+        jsonb dados_novos
+        text[] campos_alterados
+        text descricao
+        string sensibilidade
+        timestamp created_at
+        date retencao_ate
+    }
+    
+    audit_logs_alertas {
+        uuid id PK
+        uuid clinica_id FK
+        uuid audit_log_id FK
+        string tipo
+        string severidade
+        string titulo
+        text descricao
+        string status
+        uuid resolvido_por FK
+        timestamp resolvido_em
+        timestamp created_at
+    }
+    
+    consentimentos {
+        uuid id PK
+        uuid clinica_id FK
+        uuid paciente_id FK
+        string tipo
+        boolean aceito
+        string versao_termo
+        text texto_termo
+        string meio
+        string evidencia_tipo
+        string evidencia_storage_path
+        inet ip_address
+        date valido_ate
+        boolean revogado
+        timestamp revogado_em
+        timestamp created_at
+    }
+    
+    notificacoes {
+        uuid id PK
+        uuid clinica_id FK
+        uuid user_id FK
+        string perfil_destino
+        string titulo
+        text mensagem
+        string tipo
+        string prioridade
+        string link_tipo
+        uuid link_id
+        boolean lida
+        timestamp lida_em
+        timestamp expira_em
+        timestamp created_at
+    }
+    
+    sessoes {
+        uuid id PK
+        uuid user_id FK
+        uuid clinica_id FK
+        string token_hash
+        inet ip_address
+        text user_agent
+        string dispositivo
+        string cidade
+        string pais
+        boolean ativa
+        timestamp iniciada_em
+        timestamp ultimo_acesso
+        timestamp encerrada_em
+        string encerrada_por
+    }
+    
+    tentativas_login {
+        uuid id PK
+        string email
+        uuid user_id FK
+        boolean sucesso
+        string motivo_falha
+        inet ip_address
+        text user_agent
+        timestamp created_at
+    }
+    
+    audit_logs ||--o{ audit_logs_alertas : "gera"
+    pacientes ||--o{ consentimentos : "consente"
+    users ||--o{ notificacoes : "recebe"
+    users ||--o{ sessoes : "inicia"
+    users ||--o{ tentativas_login : "tenta"
+    
+    %% ============================================
+    %% FASE 7: EVIDÊNCIAS
+    %% ============================================
+    
+    evidencias {
+        uuid id PK
+        uuid clinica_id FK
+        string entidade
+        uuid entidade_id
+        string tipo
+        string categoria
+        string descricao
+        string arquivo_nome
+        string arquivo_path
+        string arquivo_mime_type
+        integer arquivo_tamanho_bytes
+        string arquivo_hash
+        jsonb dados
+        string origem
+        boolean validado
+        uuid validado_por FK
+        timestamp validado_em
+        string status
+        uuid substituido_por FK
+        uuid audit_log_id FK
+        date retencao_ate
+        timestamp created_at
+        uuid created_by_user FK
+        boolean created_by_paciente
+        boolean created_by_sistema
+    }
+    
+    evidencias_obrigatorias {
+        uuid id PK
+        string entidade
+        string acao
+        text[] tipos_evidencia
+        integer quantidade_minima
+        string logica
+        text[] excecao_perfis
+        decimal excecao_valor_ate
+        string mensagem_erro
+        boolean ativo
+        timestamp created_at
+    }
+    
+    clinicas ||--o{ evidencias : "armazena"
+    audit_logs ||--o{ evidencias : "prova"
+    evidencias ||--o| evidencias : "substitui"

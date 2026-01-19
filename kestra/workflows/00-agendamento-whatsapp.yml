@@ -1,0 +1,776 @@
+# ============================================
+# WORKFLOW: Agendamento via WhatsApp
+# ============================================
+# Fluxo conversacional completo
+# Paciente agenda sozinho pelo WhatsApp
+# Zero intervenção humana
+# ============================================
+
+id: agendamento-whatsapp
+namespace: clinica
+description: Permite paciente agendar consulta via WhatsApp de forma autônoma
+
+labels:
+  team: atendimento
+  module: agendamento
+  priority: critical
+
+inputs:
+  - id: telefone
+    type: STRING
+    required: true
+    description: Telefone do paciente (sem 55)
+
+  - id: mensagem
+    type: STRING
+    required: true
+    description: Texto da mensagem
+
+  - id: message_id
+    type: STRING
+    required: true
+    description: ID da mensagem no WhatsApp
+
+  - id: session_id
+    type: STRING
+    required: false
+    description: ID da sessão de agendamento (se já iniciada)
+
+tasks:
+  # ----------------------------------------
+  # 1. Busca ou cria sessão de conversa
+  # ----------------------------------------
+  - id: buscar_sessao
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/whatsapp/sessao"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "telefone": "{{ inputs.telefone }}",
+        "tipo": "agendamento",
+        "mensagem_recebida": "{{ inputs.mensagem }}",
+        "message_id": "{{ inputs.message_id }}"
+      }
+
+  # ----------------------------------------
+  # 2. Busca paciente (ou marca como novo)
+  # ----------------------------------------
+  - id: buscar_paciente
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/pacientes/by-telefone/{{ inputs.telefone }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+    allowFailure: true
+
+  # ----------------------------------------
+  # 3. Processa estado da conversa
+  # ----------------------------------------
+  - id: processar_estado
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    script: |
+      import json
+      import re
+      
+      sessao = json.loads('''{{ outputs.buscar_sessao.body | json }}''').get("data", {})
+      paciente_response = '''{{ outputs.buscar_paciente.body | default('{}') }}'''
+      
+      try:
+          paciente = json.loads(paciente_response).get("data", {})
+      except:
+          paciente = {}
+      
+      mensagem = "{{ inputs.mensagem }}".strip().upper()
+      estado = sessao.get("estado", "inicio")
+      contexto = sessao.get("contexto", {})
+      
+      # Detecta intenção de cancelar fluxo
+      if mensagem in ["CANCELAR", "SAIR", "VOLTAR", "0"]:
+          novo_estado = "cancelado"
+          resposta = "Ok, agendamento cancelado. Quando quiser, é só chamar! 👋"
+          acao = "finalizar"
+      
+      # Estado: INÍCIO
+      elif estado == "inicio":
+          if paciente:
+              nome = paciente.get("nome", "").split()[0]
+              resposta = f"Olá, {nome}! 👋\n\nComo posso ajudar?\n\n1️⃣ Agendar consulta\n2️⃣ Remarcar consulta\n3️⃣ Cancelar consulta\n4️⃣ Enviar exame/documento\n\nResponda com o número da opção."
+          else:
+              resposta = "Olá! 👋 Bem-vindo(a) à Clínica!\n\nComo posso ajudar?\n\n1️⃣ Agendar consulta\n2️⃣ Outras informações\n\nResponda com o número da opção."
+          
+          novo_estado = "menu_principal"
+          acao = "aguardar"
+      
+      # Estado: MENU PRINCIPAL
+      elif estado == "menu_principal":
+          if mensagem in ["1", "AGENDAR", "AGENDAR CONSULTA"]:
+              novo_estado = "escolher_especialidade"
+              acao = "listar_especialidades"
+              resposta = None  # Será preenchido pela task seguinte
+          elif mensagem in ["2", "REMARCAR"]:
+              novo_estado = "remarcar_buscar"
+              acao = "buscar_agendamentos"
+              resposta = None
+          elif mensagem in ["3", "CANCELAR CONSULTA"]:
+              novo_estado = "cancelar_buscar"
+              acao = "buscar_agendamentos"
+              resposta = None
+          elif mensagem in ["4", "EXAME", "DOCUMENTO"]:
+              resposta = "📎 Para enviar exames ou documentos, basta enviar a foto ou arquivo aqui mesmo!\n\nVou vincular automaticamente ao seu prontuário."
+              novo_estado = "aguardando_documento"
+              acao = "aguardar"
+          else:
+              resposta = "Não entendi. Por favor, responda com o número da opção:\n\n1️⃣ Agendar consulta\n2️⃣ Remarcar consulta\n3️⃣ Cancelar consulta"
+              novo_estado = "menu_principal"
+              acao = "aguardar"
+      
+      # Estado: ESCOLHER ESPECIALIDADE
+      elif estado == "escolher_especialidade":
+          # Tenta parsear número da opção
+          try:
+              opcao = int(mensagem) - 1
+              especialidades = contexto.get("especialidades", [])
+              if 0 <= opcao < len(especialidades):
+                  contexto["especialidade_id"] = especialidades[opcao]["id"]
+                  contexto["especialidade_nome"] = especialidades[opcao]["nome"]
+                  novo_estado = "escolher_medico"
+                  acao = "listar_medicos"
+                  resposta = None
+              else:
+                  resposta = "Opção inválida. Por favor, escolha um número da lista."
+                  novo_estado = "escolher_especialidade"
+                  acao = "aguardar"
+          except:
+              resposta = "Por favor, responda apenas com o número da opção."
+              novo_estado = "escolher_especialidade"
+              acao = "aguardar"
+      
+      # Estado: ESCOLHER MÉDICO
+      elif estado == "escolher_medico":
+          try:
+              opcao = int(mensagem) - 1
+              medicos = contexto.get("medicos", [])
+              if 0 <= opcao < len(medicos):
+                  contexto["medico_id"] = medicos[opcao]["id"]
+                  contexto["medico_nome"] = medicos[opcao]["nome"]
+                  novo_estado = "escolher_data"
+                  acao = "listar_datas"
+                  resposta = None
+              else:
+                  resposta = "Opção inválida. Por favor, escolha um número da lista."
+                  novo_estado = "escolher_medico"
+                  acao = "aguardar"
+          except:
+              resposta = "Por favor, responda apenas com o número da opção."
+              novo_estado = "escolher_medico"
+              acao = "aguardar"
+      
+      # Estado: ESCOLHER DATA
+      elif estado == "escolher_data":
+          if mensagem == "M" or mensagem == "MAIS":
+              # Carregar mais datas
+              acao = "listar_mais_datas"
+              novo_estado = "escolher_data"
+              resposta = None
+          else:
+              try:
+                  opcao = int(mensagem) - 1
+                  datas = contexto.get("datas", [])
+                  if 0 <= opcao < len(datas):
+                      contexto["data"] = datas[opcao]["data"]
+                      contexto["data_formatada"] = datas[opcao]["formatada"]
+                      novo_estado = "escolher_horario"
+                      acao = "listar_horarios"
+                      resposta = None
+                  else:
+                      resposta = "Opção inválida. Escolha um número da lista ou M para mais datas."
+                      novo_estado = "escolher_data"
+                      acao = "aguardar"
+              except:
+                  resposta = "Por favor, responda com o número da opção ou M para mais datas."
+                  novo_estado = "escolher_data"
+                  acao = "aguardar"
+      
+      # Estado: ESCOLHER HORÁRIO
+      elif estado == "escolher_horario":
+          try:
+              opcao = int(mensagem) - 1
+              horarios = contexto.get("horarios", [])
+              if 0 <= opcao < len(horarios):
+                  contexto["horario"] = horarios[opcao]["hora"]
+                  novo_estado = "confirmar_agendamento"
+                  acao = "mostrar_resumo"
+                  resposta = None
+              else:
+                  resposta = "Opção inválida. Por favor, escolha um número da lista."
+                  novo_estado = "escolher_horario"
+                  acao = "aguardar"
+          except:
+              resposta = "Por favor, responda apenas com o número da opção."
+              novo_estado = "escolher_horario"
+              acao = "aguardar"
+      
+      # Estado: CONFIRMAR AGENDAMENTO
+      elif estado == "confirmar_agendamento":
+          if mensagem in ["SIM", "S", "CONFIRMAR", "1", "OK"]:
+              novo_estado = "finalizado"
+              acao = "criar_agendamento"
+              resposta = None
+          elif mensagem in ["NAO", "NÃO", "N", "CANCELAR", "2"]:
+              resposta = "Ok, agendamento cancelado. Quando quiser, é só chamar! 👋"
+              novo_estado = "cancelado"
+              acao = "finalizar"
+          else:
+              resposta = "Por favor, responda:\n\n✅ *SIM* para confirmar\n❌ *NÃO* para cancelar"
+              novo_estado = "confirmar_agendamento"
+              acao = "aguardar"
+      
+      # Estado: COLETAR DADOS (paciente novo)
+      elif estado == "coletar_nome":
+          if len(mensagem) >= 3:
+              contexto["nome_paciente"] = "{{ inputs.mensagem }}".strip().title()
+              resposta = "Ótimo! Agora preciso do seu CPF (apenas números):"
+              novo_estado = "coletar_cpf"
+              acao = "aguardar"
+          else:
+              resposta = "Por favor, informe seu nome completo:"
+              novo_estado = "coletar_nome"
+              acao = "aguardar"
+      
+      elif estado == "coletar_cpf":
+          cpf = re.sub(r'\D', '', mensagem)
+          if len(cpf) == 11:
+              contexto["cpf_paciente"] = cpf
+              resposta = "Perfeito! Por último, sua data de nascimento (DD/MM/AAAA):"
+              novo_estado = "coletar_nascimento"
+              acao = "aguardar"
+          else:
+              resposta = "CPF inválido. Por favor, digite os 11 números do seu CPF:"
+              novo_estado = "coletar_cpf"
+              acao = "aguardar"
+      
+      elif estado == "coletar_nascimento":
+          # Valida formato data
+          match = re.match(r'(\d{2})[/\-](\d{2})[/\-](\d{4})', mensagem)
+          if match:
+              dia, mes, ano = match.groups()
+              contexto["nascimento_paciente"] = f"{ano}-{mes}-{dia}"
+              novo_estado = "criar_paciente"
+              acao = "criar_paciente"
+              resposta = None
+          else:
+              resposta = "Formato inválido. Por favor, digite no formato DD/MM/AAAA:"
+              novo_estado = "coletar_nascimento"
+              acao = "aguardar"
+      
+      else:
+          # Estado desconhecido, reinicia
+          resposta = "Olá! Como posso ajudar?\n\n1️⃣ Agendar consulta\n2️⃣ Remarcar consulta\n3️⃣ Cancelar consulta"
+          novo_estado = "menu_principal"
+          acao = "aguardar"
+      
+      resultado = {
+          "estado_anterior": estado,
+          "novo_estado": novo_estado,
+          "acao": acao,
+          "resposta": resposta,
+          "contexto": contexto,
+          "paciente_id": paciente.get("id"),
+          "paciente_existe": bool(paciente),
+          "clinica_id": paciente.get("clinica_id") or contexto.get("clinica_id")
+      }
+      
+      print(f"::set-output name=resultado::{json.dumps(resultado, ensure_ascii=False)}")
+
+  # ----------------------------------------
+  # 4. Atualiza sessão
+  # ----------------------------------------
+  - id: atualizar_sessao
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/whatsapp/sessao/{{ outputs.buscar_sessao.body.data.id }}"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "estado": "{{ outputs.processar_estado.vars.resultado | fromJson | attr('novo_estado') }}",
+        "contexto": {{ outputs.processar_estado.vars.resultado | fromJson | attr('contexto') | json }}
+      }
+
+  # ----------------------------------------
+  # 5. Executa ação: LISTAR ESPECIALIDADES
+  # ----------------------------------------
+  - id: acao_listar_especialidades
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.processar_estado.vars.resultado | fromJson | attr('acao') == 'listar_especialidades' }}"
+    then:
+      - id: buscar_especialidades
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/especialidades"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+        queryParams:
+          ativo: "true"
+
+      - id: formatar_especialidades
+        type: io.kestra.plugin.scripts.python.Script
+        runner: PROCESS
+        script: |
+          import json
+          
+          especialidades = json.loads('''{{ outputs.buscar_especialidades.body | json }}''').get("data", [])
+          
+          linhas = ["Qual especialidade você procura?\n"]
+          for i, esp in enumerate(especialidades, 1):
+              linhas.append(f"{i}️⃣ {esp['nome']}")
+          
+          linhas.append("\nResponda com o número da opção.")
+          
+          resposta = "\n".join(linhas)
+          
+          # Salva lista para contexto
+          lista = [{"id": e["id"], "nome": e["nome"]} for e in especialidades]
+          
+          print(f"::set-output name=resposta::{resposta}")
+          print(f"::set-output name=lista::{json.dumps(lista)}")
+
+      - id: atualizar_contexto_especialidades
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/whatsapp/sessao/{{ outputs.buscar_sessao.body.data.id }}"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "contexto": {
+              "especialidades": {{ outputs.formatar_especialidades.vars.lista }}
+            }
+          }
+
+      - id: enviar_especialidades
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+        method: POST
+        headers:
+          apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "number": "55{{ inputs.telefone }}",
+            "text": "{{ outputs.formatar_especialidades.vars.resposta }}"
+          }
+
+  # ----------------------------------------
+  # 6. Executa ação: LISTAR MÉDICOS
+  # ----------------------------------------
+  - id: acao_listar_medicos
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.processar_estado.vars.resultado | fromJson | attr('acao') == 'listar_medicos' }}"
+    then:
+      - id: buscar_medicos
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/medicos"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+        queryParams:
+          especialidade_id: "{{ outputs.processar_estado.vars.resultado | fromJson | attr('contexto') | attr('especialidade_id') }}"
+          ativo: "true"
+
+      - id: formatar_medicos
+        type: io.kestra.plugin.scripts.python.Script
+        runner: PROCESS
+        script: |
+          import json
+          
+          resultado = json.loads('''{{ outputs.processar_estado.vars.resultado }}''')
+          medicos = json.loads('''{{ outputs.buscar_medicos.body | json }}''').get("data", [])
+          especialidade = resultado["contexto"].get("especialidade_nome", "")
+          
+          linhas = [f"*{especialidade}*\n\nEscolha o médico:\n"]
+          for i, med in enumerate(medicos, 1):
+              linhas.append(f"{i}️⃣ {med['nome']}")
+          
+          linhas.append("\nResponda com o número da opção.")
+          
+          resposta = "\n".join(linhas)
+          lista = [{"id": m["id"], "nome": m["nome"]} for m in medicos]
+          
+          print(f"::set-output name=resposta::{resposta}")
+          print(f"::set-output name=lista::{json.dumps(lista)}")
+
+      - id: atualizar_contexto_medicos
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/whatsapp/sessao/{{ outputs.buscar_sessao.body.data.id }}"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "contexto": {
+              "medicos": {{ outputs.formatar_medicos.vars.lista }}
+            }
+          }
+
+      - id: enviar_medicos
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+        method: POST
+        headers:
+          apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "number": "55{{ inputs.telefone }}",
+            "text": "{{ outputs.formatar_medicos.vars.resposta }}"
+          }
+
+  # ----------------------------------------
+  # 7. Executa ação: LISTAR DATAS
+  # ----------------------------------------
+  - id: acao_listar_datas
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.processar_estado.vars.resultado | fromJson | attr('acao') == 'listar_datas' }}"
+    then:
+      - id: buscar_datas
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/agenda/datas-disponiveis"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+        queryParams:
+          medico_id: "{{ outputs.processar_estado.vars.resultado | fromJson | attr('contexto') | attr('medico_id') }}"
+          dias: "14"
+
+      - id: formatar_datas
+        type: io.kestra.plugin.scripts.python.Script
+        runner: PROCESS
+        script: |
+          import json
+          from datetime import datetime
+          
+          resultado = json.loads('''{{ outputs.processar_estado.vars.resultado }}''')
+          datas = json.loads('''{{ outputs.buscar_datas.body | json }}''').get("data", [])
+          medico = resultado["contexto"].get("medico_nome", "")
+          
+          dias_semana = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
+          
+          linhas = [f"*{medico}*\n\nDatas disponíveis:\n"]
+          lista = []
+          
+          for i, d in enumerate(datas[:7], 1):  # Mostra 7 datas por vez
+              data_obj = datetime.strptime(d["data"], "%Y-%m-%d")
+              dia_sem = dias_semana[data_obj.weekday()]
+              formatada = f"{dia_sem}, {data_obj.day:02d}/{data_obj.month:02d}"
+              linhas.append(f"{i}️⃣ {formatada} ({d['vagas']} vagas)")
+              lista.append({"data": d["data"], "formatada": formatada})
+          
+          if len(datas) > 7:
+              linhas.append("\n*M* - Ver mais datas")
+          
+          linhas.append("\nResponda com o número da opção.")
+          
+          resposta = "\n".join(linhas)
+          
+          print(f"::set-output name=resposta::{resposta}")
+          print(f"::set-output name=lista::{json.dumps(lista)}")
+
+      - id: atualizar_contexto_datas
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/whatsapp/sessao/{{ outputs.buscar_sessao.body.data.id }}"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "contexto": {
+              "datas": {{ outputs.formatar_datas.vars.lista }}
+            }
+          }
+
+      - id: enviar_datas
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+        method: POST
+        headers:
+          apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "number": "55{{ inputs.telefone }}",
+            "text": "{{ outputs.formatar_datas.vars.resposta }}"
+          }
+
+  # ----------------------------------------
+  # 8. Executa ação: LISTAR HORÁRIOS
+  # ----------------------------------------
+  - id: acao_listar_horarios
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.processar_estado.vars.resultado | fromJson | attr('acao') == 'listar_horarios' }}"
+    then:
+      - id: buscar_horarios
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/agenda/slots"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+        queryParams:
+          medico_id: "{{ outputs.processar_estado.vars.resultado | fromJson | attr('contexto') | attr('medico_id') }}"
+          data: "{{ outputs.processar_estado.vars.resultado | fromJson | attr('contexto') | attr('data') }}"
+
+      - id: formatar_horarios
+        type: io.kestra.plugin.scripts.python.Script
+        runner: PROCESS
+        script: |
+          import json
+          
+          resultado = json.loads('''{{ outputs.processar_estado.vars.resultado }}''')
+          slots = json.loads('''{{ outputs.buscar_horarios.body | json }}''').get("data", [])
+          data_fmt = resultado["contexto"].get("data_formatada", "")
+          medico = resultado["contexto"].get("medico_nome", "")
+          
+          # Filtra apenas slots disponíveis
+          disponiveis = [s for s in slots if s.get("disponivel", True)]
+          
+          linhas = [f"*{medico}*\n📅 {data_fmt}\n\nHorários disponíveis:\n"]
+          lista = []
+          
+          for i, slot in enumerate(disponiveis, 1):
+              hora = slot["hora_inicio"][:5]  # HH:MM
+              linhas.append(f"{i}️⃣ {hora}")
+              lista.append({"hora": hora, "slot_id": slot.get("id")})
+          
+          linhas.append("\nResponda com o número da opção.")
+          
+          resposta = "\n".join(linhas)
+          
+          print(f"::set-output name=resposta::{resposta}")
+          print(f"::set-output name=lista::{json.dumps(lista)}")
+
+      - id: atualizar_contexto_horarios
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/whatsapp/sessao/{{ outputs.buscar_sessao.body.data.id }}"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "contexto": {
+              "horarios": {{ outputs.formatar_horarios.vars.lista }}
+            }
+          }
+
+      - id: enviar_horarios
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+        method: POST
+        headers:
+          apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "number": "55{{ inputs.telefone }}",
+            "text": "{{ outputs.formatar_horarios.vars.resposta }}"
+          }
+
+  # ----------------------------------------
+  # 9. Executa ação: MOSTRAR RESUMO
+  # ----------------------------------------
+  - id: acao_mostrar_resumo
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.processar_estado.vars.resultado | fromJson | attr('acao') == 'mostrar_resumo' }}"
+    then:
+      - id: montar_resumo
+        type: io.kestra.plugin.scripts.python.Script
+        runner: PROCESS
+        script: |
+          import json
+          
+          resultado = json.loads('''{{ outputs.processar_estado.vars.resultado }}''')
+          ctx = resultado["contexto"]
+          
+          resposta = f"""✅ *CONFIRME SEU AGENDAMENTO*
+
+📅 *Data:* {ctx.get('data_formatada', '')}
+⏰ *Horário:* {ctx.get('horario', '')}
+👨‍⚕️ *Médico:* {ctx.get('medico_nome', '')}
+🏥 *Especialidade:* {ctx.get('especialidade_nome', '')}
+
+Confirma o agendamento?
+
+*SIM* - Confirmar
+*NÃO* - Cancelar"""
+          
+          print(f"::set-output name=resposta::{resposta}")
+
+      - id: enviar_resumo
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+        method: POST
+        headers:
+          apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "number": "55{{ inputs.telefone }}",
+            "text": "{{ outputs.montar_resumo.vars.resposta }}"
+          }
+
+  # ----------------------------------------
+  # 10. Executa ação: CRIAR AGENDAMENTO
+  # ----------------------------------------
+  - id: acao_criar_agendamento
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.processar_estado.vars.resultado | fromJson | attr('acao') == 'criar_agendamento' }}"
+    then:
+      # Verifica se precisa criar paciente primeiro
+      - id: verificar_paciente
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.processar_estado.vars.resultado | fromJson | attr('paciente_existe') == false }}"
+        then:
+          - id: criar_paciente_novo
+            type: io.kestra.plugin.core.http.Request
+            uri: "{{ secret('API_URL') }}/v1/internal/pacientes"
+            method: POST
+            headers:
+              Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+              Content-Type: application/json
+            body: |
+              {
+                "nome": "{{ outputs.processar_estado.vars.resultado | fromJson | attr('contexto') | attr('nome_paciente') }}",
+                "telefone": "{{ inputs.telefone }}",
+                "cpf": "{{ outputs.processar_estado.vars.resultado | fromJson | attr('contexto') | attr('cpf_paciente') }}",
+                "data_nascimento": "{{ outputs.processar_estado.vars.resultado | fromJson | attr('contexto') | attr('nascimento_paciente') }}",
+                "clinica_id": "{{ outputs.processar_estado.vars.resultado | fromJson | attr('clinica_id') }}",
+                "origem": "whatsapp"
+              }
+
+      - id: criar_agendamento_db
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/agendamentos"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "paciente_id": "{{ outputs.processar_estado.vars.resultado | fromJson | attr('paciente_id') | default(outputs.criar_paciente_novo.body.data.id) }}",
+            "medico_id": "{{ outputs.processar_estado.vars.resultado | fromJson | attr('contexto') | attr('medico_id') }}",
+            "data": "{{ outputs.processar_estado.vars.resultado | fromJson | attr('contexto') | attr('data') }}",
+            "hora_inicio": "{{ outputs.processar_estado.vars.resultado | fromJson | attr('contexto') | attr('horario') }}",
+            "tipo": "consulta",
+            "status": "confirmado",
+            "confirmado_via": "whatsapp",
+            "origem": "whatsapp_autoatendimento"
+          }
+
+      - id: criar_card_kanban
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/cards"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "agendamento_id": "{{ outputs.criar_agendamento_db.body.data.id }}",
+            "fase": 0,
+            "status": "ativo"
+          }
+
+      - id: enviar_confirmacao_final
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+        method: POST
+        headers:
+          apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "number": "55{{ inputs.telefone }}",
+            "text": "🎉 *CONSULTA AGENDADA COM SUCESSO!*\n\n📅 {{ outputs.processar_estado.vars.resultado | fromJson | attr('contexto') | attr('data_formatada') }}\n⏰ {{ outputs.processar_estado.vars.resultado | fromJson | attr('contexto') | attr('horario') }}\n👨‍⚕️ {{ outputs.processar_estado.vars.resultado | fromJson | attr('contexto') | attr('medico_nome') }}\n\n📍 Endereço: [Endereço da clínica]\n\nEnviaremos um lembrete antes da consulta.\n\nPrecisando de algo, é só chamar! 💙"
+          }
+
+      - id: finalizar_sessao
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/whatsapp/sessao/{{ outputs.buscar_sessao.body.data.id }}"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "estado": "finalizado",
+            "finalizado_em": "{{ now() }}",
+            "resultado": "agendamento_criado",
+            "agendamento_id": "{{ outputs.criar_agendamento_db.body.data.id }}"
+          }
+
+  # ----------------------------------------
+  # 11. Envia resposta simples (se houver)
+  # ----------------------------------------
+  - id: enviar_resposta_simples
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.processar_estado.vars.resultado | fromJson | attr('resposta') != None and outputs.processar_estado.vars.resultado | fromJson | attr('acao') == 'aguardar' }}"
+    then:
+      - id: enviar_msg
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+        method: POST
+        headers:
+          apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "number": "55{{ inputs.telefone }}",
+            "text": "{{ outputs.processar_estado.vars.resultado | fromJson | attr('resposta') }}"
+          }
+
+  # ----------------------------------------
+  # 12. Registra mensagem
+  # ----------------------------------------
+  - id: registrar_mensagem
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/mensagens"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "telefone": "{{ inputs.telefone }}",
+        "direcao": "recebida",
+        "conteudo": "{{ inputs.mensagem }}",
+        "message_id": "{{ inputs.message_id }}",
+        "sessao_id": "{{ outputs.buscar_sessao.body.data.id }}",
+        "estado_conversa": "{{ outputs.processar_estado.vars.resultado | fromJson | attr('novo_estado') }}"
+      }
+
+errors:
+  - id: erro_generico
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+    method: POST
+    headers:
+      apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "number": "55{{ inputs.telefone }}",
+        "text": "Ops! Tive um probleminha técnico. 😅\n\nPor favor, tente novamente em alguns instantes ou ligue para nossa central:\n📞 (11) 3333-4444"
+      }
+
+triggers:
+  - id: webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "agendamento-whatsapp-trigger"

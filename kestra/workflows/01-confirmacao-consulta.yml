@@ -1,0 +1,155 @@
+# ============================================
+# WORKFLOW: Confirmação de Consulta
+# ============================================
+# Dispara quando agendamento é criado
+# Envia WhatsApp pedindo confirmação
+# ============================================
+
+id: confirmacao-consulta
+namespace: clinica
+description: Envia mensagem de confirmação de consulta via WhatsApp
+
+labels:
+  team: atendimento
+  module: agenda
+  priority: high
+
+inputs:
+  - id: agendamento_id
+    type: STRING
+    required: true
+    description: ID do agendamento
+
+  - id: paciente_telefone
+    type: STRING
+    required: true
+    description: Telefone do paciente
+
+  - id: paciente_nome
+    type: STRING
+    required: true
+    description: Nome do paciente
+
+  - id: medico_nome
+    type: STRING
+    required: true
+    description: Nome do médico
+
+  - id: data
+    type: STRING
+    required: true
+    description: Data da consulta (YYYY-MM-DD)
+
+  - id: hora
+    type: STRING
+    required: true
+    description: Horário da consulta (HH:MM)
+
+  - id: clinica_id
+    type: STRING
+    required: true
+    description: ID da clínica
+
+tasks:
+  # ----------------------------------------
+  # 1. Formata data para exibição
+  # ----------------------------------------
+  - id: formatar_data
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    script: |
+      from datetime import datetime
+      
+      data_str = "{{ inputs.data }}"
+      data = datetime.strptime(data_str, "%Y-%m-%d")
+      
+      dias_semana = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
+      meses = ["", "janeiro", "fevereiro", "março", "abril", "maio", "junho", 
+               "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
+      
+      dia_semana = dias_semana[data.weekday()]
+      data_formatada = f"{dia_semana}, {data.day} de {meses[data.month]}"
+      
+      print(f"::set-output name=data_formatada::{data_formatada}")
+
+  # ----------------------------------------
+  # 2. Envia WhatsApp via Evolution API
+  # ----------------------------------------
+  - id: enviar_whatsapp
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+    method: POST
+    headers:
+      apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "number": "55{{ inputs.paciente_telefone }}",
+        "text": "Olá, {{ inputs.paciente_nome }}! 👋\n\nConfirmamos sua consulta:\n\n📅 {{ outputs.formatar_data.vars.data_formatada }}\n⏰ Horário: {{ inputs.hora }}\n👨‍⚕️ Médico: {{ inputs.medico_nome }}\n\nPara *confirmar*, responda SIM\nPara *cancelar*, responda CANCELAR\n\nEm caso de dúvidas, entre em contato conosco."
+      }
+
+  # ----------------------------------------
+  # 3. Registra envio no banco
+  # ----------------------------------------
+  - id: registrar_envio
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/mensagens"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "clinica_id": "{{ inputs.clinica_id }}",
+        "agendamento_id": "{{ inputs.agendamento_id }}",
+        "paciente_telefone": "{{ inputs.paciente_telefone }}",
+        "tipo": "confirmacao_consulta",
+        "direcao": "enviada",
+        "status": "enviada",
+        "conteudo": "Confirmação de consulta enviada",
+        "message_id": "{{ outputs.enviar_whatsapp.body.key.id }}"
+      }
+
+  # ----------------------------------------
+  # 4. Atualiza card do Kanban
+  # ----------------------------------------
+  - id: atualizar_card
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/cards/by-agendamento/{{ inputs.agendamento_id }}/checklist/confirmacao_enviada"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "concluido": true,
+        "automatico": true
+      }
+
+errors:
+  - id: notificar_erro
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/alertas"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "clinica_id": "{{ inputs.clinica_id }}",
+        "tipo": "workflow_error",
+        "titulo": "Erro ao enviar confirmação",
+        "mensagem": "Falha ao enviar WhatsApp para {{ inputs.paciente_nome }}",
+        "referencia_tipo": "agendamento",
+        "referencia_id": "{{ inputs.agendamento_id }}",
+        "dados": {
+          "workflow": "confirmacao-consulta",
+          "erro": "{{ error.message }}"
+        }
+      }
+
+triggers:
+  # Pode ser disparado via API
+  - id: webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "confirmacao-consulta-trigger"

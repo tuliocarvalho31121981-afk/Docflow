@@ -1,0 +1,89 @@
+# ============================================
+# DOCKER COMPOSE - Desenvolvimento Local
+# ============================================
+
+version: '3.8'
+
+services:
+  # ==========================================
+  # API Backend
+  # ==========================================
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: clinica-api
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=development
+      - DEBUG=true
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - /app/__pycache__
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - clinica-network
+    depends_on:
+      - redis
+
+  # ==========================================
+  # Redis (Cache & Rate Limiting)
+  # ==========================================
+  redis:
+    image: redis:7-alpine
+    container_name: clinica-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - clinica-network
+
+  # ==========================================
+  # Kestra (Workflow Orchestration)
+  # ==========================================
+  kestra:
+    image: kestra/kestra:latest
+    container_name: clinica-kestra
+    ports:
+      - "8080:8080"
+    environment:
+      - KESTRA_CONFIGURATION_PATH=/app/kestra/config.yaml
+    volumes:
+      - kestra-data:/app/storage
+      - ./kestra:/app/kestra
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - clinica-network
+
+# ==========================================
+# Volumes
+# ==========================================
+volumes:
+  redis-data:
+  kestra-data:
+
+# ==========================================
+# Networks
+# ==========================================
+networks:
+  clinica-network:
+    driver: bridge

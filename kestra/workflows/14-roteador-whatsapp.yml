@@ -1,0 +1,242 @@
+# ============================================
+# WORKFLOW: Roteador de Mensagens WhatsApp
+# ============================================
+# Ponto de entrada para TODAS as mensagens
+# Identifica contexto e roteia para workflow correto
+# ============================================
+
+id: roteador-whatsapp
+namespace: clinica
+description: Roteia mensagens WhatsApp para o workflow apropriado
+
+labels:
+  team: atendimento
+  module: whatsapp
+  priority: critical
+
+inputs:
+  - id: telefone
+    type: STRING
+    required: true
+    description: Telefone do remetente
+
+  - id: mensagem
+    type: STRING
+    required: false
+    description: Texto da mensagem
+
+  - id: message_id
+    type: STRING
+    required: true
+    description: ID da mensagem
+
+  - id: tipo_mensagem
+    type: STRING
+    required: true
+    description: "Tipo: text, image, document, audio"
+
+  - id: media_url
+    type: STRING
+    required: false
+    description: URL da mídia
+
+  - id: media_mimetype
+    type: STRING
+    required: false
+    description: MIME type da mídia
+
+tasks:
+  # ----------------------------------------
+  # 1. Verifica sessão ativa de agendamento
+  # ----------------------------------------
+  - id: verificar_sessao_agendamento
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/whatsapp/sessao/ativa"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+    queryParams:
+      telefone: "{{ inputs.telefone }}"
+      tipo: agendamento
+    allowFailure: true
+
+  # ----------------------------------------
+  # 2. Verifica se tem agendamento aguardando checkin
+  # ----------------------------------------
+  - id: verificar_checkin_pendente
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/agendamentos/aguardando-checkin"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+    queryParams:
+      telefone: "{{ inputs.telefone }}"
+    allowFailure: true
+
+  # ----------------------------------------
+  # 3. Verifica se tem agendamento aguardando confirmação
+  # ----------------------------------------
+  - id: verificar_confirmacao_pendente
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/agendamentos/pendente-confirmacao"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+    queryParams:
+      paciente_telefone: "{{ inputs.telefone }}"
+    allowFailure: true
+
+  # ----------------------------------------
+  # 4. Decide para qual workflow rotear
+  # ----------------------------------------
+  - id: decidir_rota
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    script: |
+      import json
+      
+      tipo = "{{ inputs.tipo_mensagem }}"
+      mensagem = "{{ inputs.mensagem }}".strip().upper() if "{{ inputs.mensagem }}" else ""
+      
+      # Verifica sessão de agendamento
+      try:
+          sessao = json.loads('''{{ outputs.verificar_sessao_agendamento.body | json }}''').get("data")
+      except:
+          sessao = None
+      
+      # Verifica checkin pendente
+      try:
+          checkin = json.loads('''{{ outputs.verificar_checkin_pendente.body | json }}''').get("data")
+      except:
+          checkin = None
+      
+      # Verifica confirmação pendente
+      try:
+          confirmacao = json.loads('''{{ outputs.verificar_confirmacao_pendente.body | json }}''').get("data", [])
+      except:
+          confirmacao = []
+      
+      # REGRAS DE ROTEAMENTO (ordem de prioridade)
+      
+      # 1. Se é mídia (imagem/documento) → Processar exame
+      if tipo in ["image", "document"]:
+          workflow = "processar-exame-whatsapp"
+          motivo = "midia_recebida"
+      
+      # 2. Se tem sessão de agendamento ativa → Continuar agendamento
+      elif sessao and sessao.get("estado") not in ["finalizado", "cancelado"]:
+          workflow = "agendamento-whatsapp"
+          motivo = "sessao_agendamento_ativa"
+      
+      # 3. Se é resposta de check-in (CHEGUEI, CAMINHO)
+      elif checkin and mensagem in ["CHEGUEI", "CHEGEI", "CAMINHO", "JA CHEGUEI", "ESTOU INDO"]:
+          workflow = "processar-checkin"
+          motivo = "resposta_checkin"
+      
+      # 4. Se é resposta de confirmação (SIM, NAO, CANCELAR)
+      elif confirmacao and mensagem in ["SIM", "S", "NAO", "NÃO", "N", "CANCELAR", "REMARCAR"]:
+          workflow = "processar-mensagem-whatsapp"
+          motivo = "resposta_confirmacao"
+      
+      # 5. Se quer iniciar agendamento
+      elif mensagem in ["AGENDAR", "1", "MARCAR", "CONSULTA", "OI", "OLÁ", "MENU"]:
+          workflow = "agendamento-whatsapp"
+          motivo = "inicio_agendamento"
+      
+      # 6. Default: Tentar processar como mensagem geral
+      else:
+          workflow = "processar-mensagem-whatsapp"
+          motivo = "mensagem_geral"
+      
+      print(f"::set-output name=workflow::{workflow}")
+      print(f"::set-output name=motivo::{motivo}")
+
+  # ----------------------------------------
+  # 5. Roteia para workflow de AGENDAMENTO
+  # ----------------------------------------
+  - id: rota_agendamento
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.decidir_rota.vars.workflow == 'agendamento-whatsapp' }}"
+    then:
+      - id: executar_agendamento
+        type: io.kestra.plugin.core.flow.Subflow
+        flowId: agendamento-whatsapp
+        namespace: clinica
+        inputs:
+          telefone: "{{ inputs.telefone }}"
+          mensagem: "{{ inputs.mensagem }}"
+          message_id: "{{ inputs.message_id }}"
+        wait: true
+
+  # ----------------------------------------
+  # 6. Roteia para workflow de CHECK-IN
+  # ----------------------------------------
+  - id: rota_checkin
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.decidir_rota.vars.workflow == 'processar-checkin' }}"
+    then:
+      - id: executar_checkin
+        type: io.kestra.plugin.core.flow.Subflow
+        flowId: processar-checkin
+        namespace: clinica
+        inputs:
+          telefone: "{{ inputs.telefone }}"
+          mensagem: "{{ inputs.mensagem }}"
+          message_id: "{{ inputs.message_id }}"
+        wait: true
+
+  # ----------------------------------------
+  # 7. Roteia para workflow de EXAME
+  # ----------------------------------------
+  - id: rota_exame
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.decidir_rota.vars.workflow == 'processar-exame-whatsapp' }}"
+    then:
+      - id: executar_exame
+        type: io.kestra.plugin.core.flow.Subflow
+        flowId: processar-exame-whatsapp
+        namespace: clinica
+        inputs:
+          paciente_telefone: "{{ inputs.telefone }}"
+          media_url: "{{ inputs.media_url }}"
+          media_mimetype: "{{ inputs.media_mimetype }}"
+          message_id: "{{ inputs.message_id }}"
+        wait: false
+
+  # ----------------------------------------
+  # 8. Roteia para workflow de MENSAGEM GERAL
+  # ----------------------------------------
+  - id: rota_mensagem
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.decidir_rota.vars.workflow == 'processar-mensagem-whatsapp' }}"
+    then:
+      - id: executar_mensagem
+        type: io.kestra.plugin.core.flow.Subflow
+        flowId: processar-mensagem-whatsapp
+        namespace: clinica
+        inputs:
+          telefone: "{{ inputs.telefone }}"
+          mensagem: "{{ inputs.mensagem }}"
+          message_id: "{{ inputs.message_id }}"
+          tipo_mensagem: "{{ inputs.tipo_mensagem }}"
+          media_url: "{{ inputs.media_url }}"
+          media_mimetype: "{{ inputs.media_mimetype }}"
+        wait: true
+
+  # ----------------------------------------
+  # 9. Log de roteamento
+  # ----------------------------------------
+  - id: log
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Mensagem roteada:
+      - Telefone: {{ inputs.telefone }}
+      - Tipo: {{ inputs.tipo_mensagem }}
+      - Workflow: {{ outputs.decidir_rota.vars.workflow }}
+      - Motivo: {{ outputs.decidir_rota.vars.motivo }}
+
+triggers:
+  # Webhook principal do WhatsApp
+  - id: webhook_whatsapp
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "whatsapp-incoming"

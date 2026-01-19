@@ -1,0 +1,251 @@
+# ============================================
+# WORKFLOW: Processar Exame WhatsApp
+# ============================================
+# Dispara quando paciente envia mídia
+# OCR extrai dados do exame
+# Vincula ao card/consulta automaticamente
+# ============================================
+
+id: processar-exame-whatsapp
+namespace: clinica
+description: Processa exame enviado pelo paciente via WhatsApp
+
+labels:
+  team: atendimento
+  module: exames
+  priority: high
+
+inputs:
+  - id: paciente_telefone
+    type: STRING
+    required: true
+    description: Telefone do paciente
+
+  - id: media_url
+    type: STRING
+    required: true
+    description: URL da mídia no WhatsApp
+
+  - id: media_mimetype
+    type: STRING
+    required: true
+    description: MIME type da mídia
+
+  - id: message_id
+    type: STRING
+    required: true
+    description: ID da mensagem
+
+tasks:
+  # ----------------------------------------
+  # 1. Busca paciente
+  # ----------------------------------------
+  - id: buscar_paciente
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/pacientes/by-telefone/{{ inputs.paciente_telefone }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+
+  # ----------------------------------------
+  # 2. Busca card ativo do paciente
+  # ----------------------------------------
+  - id: buscar_card
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/cards/ativo-paciente/{{ outputs.buscar_paciente.body.data.id }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+    allowFailure: true
+
+  # ----------------------------------------
+  # 3. Download da mídia
+  # ----------------------------------------
+  - id: download_midia
+    type: io.kestra.plugin.core.http.Download
+    uri: "{{ inputs.media_url }}"
+    headers:
+      apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+
+  # ----------------------------------------
+  # 4. Upload para Storage
+  # ----------------------------------------
+  - id: upload_storage
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    script: |
+      import httpx
+      import base64
+      from datetime import datetime
+      
+      # Lê arquivo baixado
+      with open("{{ outputs.download_midia.uri }}", "rb") as f:
+          file_content = f.read()
+      
+      # Gera path único
+      timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+      paciente_id = "{{ outputs.buscar_paciente.body.data.id }}"
+      extensao = "{{ inputs.media_mimetype }}".split("/")[-1]
+      path = f"exames/{paciente_id}/{timestamp}.{extensao}"
+      
+      # Upload para Supabase Storage
+      url = f"{{ secret('SUPABASE_URL') }}/storage/v1/object/clinica-files/{path}"
+      
+      response = httpx.post(
+          url,
+          headers={
+              "Authorization": f"Bearer {{ secret('SUPABASE_SERVICE_KEY') }}",
+              "Content-Type": "{{ inputs.media_mimetype }}"
+          },
+          content=file_content,
+          timeout=60.0
+      )
+      
+      print(f"::set-output name=storage_path::{path}")
+
+  # ----------------------------------------
+  # 5. OCR se for imagem/PDF
+  # ----------------------------------------
+  - id: verificar_tipo
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    script: |
+      mimetype = "{{ inputs.media_mimetype }}"
+      fazer_ocr = mimetype.startswith("image/") or mimetype == "application/pdf"
+      print(f"::set-output name=fazer_ocr::{str(fazer_ocr).lower()}")
+
+  - id: ocr
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.verificar_tipo.vars.fazer_ocr == 'true' }}"
+    then:
+      - id: executar_ocr
+        type: io.kestra.plugin.core.http.Request
+        uri: "https://vision.googleapis.com/v1/images:annotate?key={{ secret('GOOGLE_VISION_API_KEY') }}"
+        method: POST
+        headers:
+          Content-Type: application/json
+        body: |
+          {
+            "requests": [
+              {
+                "image": {
+                  "source": {
+                    "imageUri": "{{ secret('SUPABASE_URL') }}/storage/v1/object/public/clinica-files/{{ outputs.upload_storage.vars.storage_path }}"
+                  }
+                },
+                "features": [
+                  {"type": "TEXT_DETECTION"}
+                ]
+              }
+            ]
+          }
+
+      - id: extrair_texto_ocr
+        type: io.kestra.plugin.scripts.python.Script
+        runner: PROCESS
+        script: |
+          import json
+          
+          response = json.loads('''{{ outputs.executar_ocr.body | json }}''')
+          texto = ""
+          if response.get("responses"):
+              annotations = response["responses"][0].get("textAnnotations", [])
+              if annotations:
+                  texto = annotations[0].get("description", "")
+          
+          print(f"::set-output name=texto::{texto[:500]}")  # Limita tamanho
+
+  # ----------------------------------------
+  # 6. Identifica tipo de exame
+  # ----------------------------------------
+  - id: identificar_exame
+    type: io.kestra.plugin.core.http.Request
+    uri: "https://api.anthropic.com/v1/messages"
+    method: POST
+    headers:
+      x-api-key: "{{ secret('ANTHROPIC_API_KEY') }}"
+      anthropic-version: "2023-06-01"
+      Content-Type: application/json
+    body: |
+      {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 256,
+        "system": "Identifique o tipo de exame médico a partir do texto. Responda em JSON: {\"tipo\": \"hemograma|raio_x|ultrassom|eletro|outro\", \"subtipo\": \"especificação\", \"data_exame\": \"YYYY-MM-DD ou null\", \"laboratorio\": \"nome ou null\", \"confianca\": 0.95}",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Texto do exame:\n{{ outputs.extrair_texto_ocr.vars.texto | default('Imagem sem texto identificável') }}"
+          }
+        ]
+      }
+    allowFailure: true
+
+  # ----------------------------------------
+  # 7. Registra documento
+  # ----------------------------------------
+  - id: registrar_documento
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/documentos"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "clinica_id": "{{ outputs.buscar_paciente.body.data.clinica_id }}",
+        "paciente_id": "{{ outputs.buscar_paciente.body.data.id }}",
+        "card_id": {{ outputs.buscar_card.body.data.id | default('null') }},
+        "tipo": "exame",
+        "storage_path": "{{ outputs.upload_storage.vars.storage_path }}",
+        "nome_arquivo": "Exame via WhatsApp",
+        "mimetype": "{{ inputs.media_mimetype }}",
+        "origem": "whatsapp",
+        "whatsapp_message_id": "{{ inputs.message_id }}"
+      }
+
+  # ----------------------------------------
+  # 8. Atualiza checklist do card
+  # ----------------------------------------
+  - id: atualizar_checklist
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.buscar_card.body.data is defined }}"
+    then:
+      - id: marcar_checklist
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/cards/{{ outputs.buscar_card.body.data.id }}/checklist/exame-enviado"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "concluido": true,
+            "automatico": true,
+            "documento_id": "{{ outputs.registrar_documento.body.data.id }}"
+          }
+
+  # ----------------------------------------
+  # 9. Notifica equipe
+  # ----------------------------------------
+  - id: notificar
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/notificacoes/broadcast"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "clinica_id": "{{ outputs.buscar_paciente.body.data.clinica_id }}",
+        "perfil_filtro": ["medico", "recepcao"],
+        "tipo": "exame_recebido",
+        "titulo": "Exame recebido via WhatsApp",
+        "mensagem": "{{ outputs.buscar_paciente.body.data.nome }} enviou um exame",
+        "referencia_tipo": "documento",
+        "referencia_id": "{{ outputs.registrar_documento.body.data.id }}"
+      }
+
+triggers:
+  - id: webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "processar-exame-whatsapp-trigger"

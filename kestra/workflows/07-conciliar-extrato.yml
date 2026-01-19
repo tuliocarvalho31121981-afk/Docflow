@@ -1,0 +1,298 @@
+# ============================================
+# WORKFLOW: Conciliação Automática
+# ============================================
+# Dispara após importação de extrato OFX
+# Faz match automático com contas pagar/receber
+# Sugere conciliações com score de confiança
+# ============================================
+
+id: conciliar-extrato
+namespace: clinica
+description: Concilia automaticamente transações do extrato com contas
+
+labels:
+  team: financeiro
+  module: conciliacao
+  priority: medium
+
+inputs:
+  - id: conta_bancaria_id
+    type: STRING
+    required: true
+    description: ID da conta bancária
+
+  - id: clinica_id
+    type: STRING
+    required: true
+    description: ID da clínica
+
+  - id: importacao_id
+    type: STRING
+    required: true
+    description: ID do lote de importação
+
+tasks:
+  # ----------------------------------------
+  # 1. Busca transações não conciliadas
+  # ----------------------------------------
+  - id: buscar_transacoes
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/extrato"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+    queryParams:
+      conta_bancaria_id: "{{ inputs.conta_bancaria_id }}"
+      importacao_id: "{{ inputs.importacao_id }}"
+      conciliado: "false"
+
+  # ----------------------------------------
+  # 2. Busca contas a pagar pendentes
+  # ----------------------------------------
+  - id: buscar_contas_pagar
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/contas-pagar"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+    queryParams:
+      clinica_id: "{{ inputs.clinica_id }}"
+      status: pendente,aprovado
+      limit: "500"
+
+  # ----------------------------------------
+  # 3. Busca contas a receber pendentes
+  # ----------------------------------------
+  - id: buscar_contas_receber
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/contas-receber"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+    queryParams:
+      clinica_id: "{{ inputs.clinica_id }}"
+      status: pendente
+      limit: "500"
+
+  # ----------------------------------------
+  # 4. Algoritmo de matching
+  # ----------------------------------------
+  - id: fazer_matching
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    script: |
+      import json
+      from datetime import datetime, timedelta
+      from difflib import SequenceMatcher
+      
+      transacoes = json.loads('''{{ outputs.buscar_transacoes.body | json }}''').get("data", [])
+      contas_pagar = json.loads('''{{ outputs.buscar_contas_pagar.body | json }}''').get("data", [])
+      contas_receber = json.loads('''{{ outputs.buscar_contas_receber.body | json }}''').get("data", [])
+      
+      def similar(a, b):
+          """Calcula similaridade entre strings."""
+          if not a or not b:
+              return 0
+          return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+      
+      def parse_date(d):
+          """Parse de data."""
+          if isinstance(d, str):
+              return datetime.strptime(d[:10], "%Y-%m-%d")
+          return d
+      
+      def days_diff(d1, d2):
+          """Diferença em dias."""
+          return abs((parse_date(d1) - parse_date(d2)).days)
+      
+      sugestoes = []
+      
+      for trans in transacoes:
+          melhor_match = None
+          melhor_score = 0
+          
+          # Débito → busca em contas a pagar
+          if trans["tipo"] == "debito":
+              for cp in contas_pagar:
+                  score = 0
+                  
+                  # Score por valor (40%)
+                  valor_diff = abs(trans["valor"] - cp["valor"]) / max(trans["valor"], cp["valor"])
+                  if valor_diff == 0:
+                      score += 40
+                  elif valor_diff <= 0.01:  # 1% de diferença
+                      score += 35
+                  elif valor_diff <= 0.05:
+                      score += 20
+                  
+                  # Score por data (30%)
+                  diff_dias = days_diff(trans["data"], cp["data_vencimento"])
+                  if diff_dias == 0:
+                      score += 30
+                  elif diff_dias <= 3:
+                      score += 25
+                  elif diff_dias <= 7:
+                      score += 15
+                  
+                  # Score por nome (30%)
+                  descricao_trans = trans.get("descricao", "")
+                  fornecedor_nome = cp.get("fornecedor", {}).get("nome", "")
+                  similaridade = similar(descricao_trans, fornecedor_nome)
+                  score += similaridade * 30
+                  
+                  if score > melhor_score:
+                      melhor_score = score
+                      melhor_match = {
+                          "tipo": "conta_pagar",
+                          "conta_id": cp["id"],
+                          "conta_descricao": cp.get("descricao", ""),
+                          "conta_valor": cp["valor"],
+                          "score": round(score, 2)
+                      }
+          
+          # Crédito → busca em contas a receber
+          else:
+              for cr in contas_receber:
+                  score = 0
+                  
+                  # Score por valor (40%)
+                  valor_diff = abs(trans["valor"] - cr["valor"]) / max(trans["valor"], cr["valor"])
+                  if valor_diff == 0:
+                      score += 40
+                  elif valor_diff <= 0.01:
+                      score += 35
+                  elif valor_diff <= 0.05:
+                      score += 20
+                  
+                  # Score por data (30%)
+                  diff_dias = days_diff(trans["data"], cr.get("data_prevista", cr["created_at"]))
+                  if diff_dias <= 3:
+                      score += 30
+                  elif diff_dias <= 7:
+                      score += 20
+                  
+                  # Score por nome (30%)
+                  descricao_trans = trans.get("descricao", "")
+                  paciente_nome = cr.get("paciente", {}).get("nome", "")
+                  similaridade = similar(descricao_trans, paciente_nome)
+                  score += similaridade * 30
+                  
+                  if score > melhor_score:
+                      melhor_score = score
+                      melhor_match = {
+                          "tipo": "conta_receber",
+                          "conta_id": cr["id"],
+                          "conta_descricao": cr.get("descricao", ""),
+                          "conta_valor": cr["valor"],
+                          "score": round(score, 2)
+                      }
+          
+          # Só sugere se score >= 60
+          if melhor_match and melhor_score >= 60:
+              sugestoes.append({
+                  "transacao_id": trans["id"],
+                  "transacao_data": trans["data"],
+                  "transacao_valor": trans["valor"],
+                  "transacao_descricao": trans.get("descricao", ""),
+                  "match": melhor_match
+              })
+      
+      resultado = {
+          "total_transacoes": len(transacoes),
+          "total_sugestoes": len(sugestoes),
+          "sugestoes": sugestoes
+      }
+      
+      print(f"::set-output name=resultado::{json.dumps(resultado)}")
+
+  # ----------------------------------------
+  # 5. Salva sugestões no banco
+  # ----------------------------------------
+  - id: salvar_sugestoes
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/conciliacao/sugestoes"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "clinica_id": "{{ inputs.clinica_id }}",
+        "conta_bancaria_id": "{{ inputs.conta_bancaria_id }}",
+        "importacao_id": "{{ inputs.importacao_id }}",
+        "sugestoes": {{ outputs.fazer_matching.vars.resultado }}
+      }
+
+  # ----------------------------------------
+  # 6. Auto-concilia com score alto
+  # ----------------------------------------
+  - id: auto_conciliar
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    script: |
+      import json
+      
+      resultado = json.loads('''{{ outputs.fazer_matching.vars.resultado }}''')
+      
+      # Filtra sugestões com score >= 90 para auto-conciliar
+      auto_conciliar = [
+          s for s in resultado["sugestoes"]
+          if s["match"]["score"] >= 90
+      ]
+      
+      print(f"::set-output name=auto_conciliar::{json.dumps(auto_conciliar)}")
+      print(f"::set-output name=total::{len(auto_conciliar)}")
+
+  - id: executar_auto_conciliacao
+    type: io.kestra.plugin.core.flow.EachSequential
+    value: "{{ outputs.auto_conciliar.vars.auto_conciliar | fromJson }}"
+    tasks:
+      - id: conciliar_item
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/extrato/{{ taskrun.value.transacao_id }}/conciliar"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "{{ taskrun.value.match.tipo }}_id": "{{ taskrun.value.match.conta_id }}",
+            "automatico": true,
+            "score": {{ taskrun.value.match.score }}
+          }
+
+  # ----------------------------------------
+  # 7. Notifica resultado
+  # ----------------------------------------
+  - id: notificar
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/notificacoes/broadcast"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "clinica_id": "{{ inputs.clinica_id }}",
+        "perfil_filtro": ["admin", "financeiro"],
+        "tipo": "conciliacao_concluida",
+        "titulo": "Conciliação automática concluída",
+        "mensagem": "{{ outputs.auto_conciliar.vars.total }} transações conciliadas automaticamente. {{ outputs.fazer_matching.vars.resultado | fromJson | attr('total_sugestoes') - outputs.auto_conciliar.vars.total }} sugestões aguardam revisão.",
+        "acao_url": "/financeiro/conciliacao"
+      }
+
+  # ----------------------------------------
+  # 8. Log de conclusão
+  # ----------------------------------------
+  - id: log
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Conciliação concluída:
+      - Transações: {{ outputs.fazer_matching.vars.resultado | fromJson | attr('total_transacoes') }}
+      - Sugestões: {{ outputs.fazer_matching.vars.resultado | fromJson | attr('total_sugestoes') }}
+      - Auto-conciliadas: {{ outputs.auto_conciliar.vars.total }}
+
+triggers:
+  - id: webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "conciliar-extrato-trigger"

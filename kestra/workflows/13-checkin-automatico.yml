@@ -1,0 +1,333 @@
+# ============================================
+# WORKFLOW: Check-in Automático
+# ============================================
+# Executa a cada minuto durante horário comercial
+# Envia mensagem 5 minutos antes da consulta
+# Paciente confirma chegada via WhatsApp
+# Move card automaticamente no Kanban
+# ============================================
+
+id: checkin-automatico
+namespace: clinica
+description: Envia solicitação de check-in 5 minutos antes da consulta
+
+labels:
+  team: atendimento
+  module: checkin
+  priority: critical
+
+tasks:
+  # ----------------------------------------
+  # 1. Busca consultas nos próximos 5-6 min
+  # ----------------------------------------
+  - id: calcular_janela
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    script: |
+      from datetime import datetime, timedelta
+      
+      agora = datetime.now()
+      
+      # Janela: consultas entre 5 e 6 minutos a partir de agora
+      inicio = agora + timedelta(minutes=5)
+      fim = agora + timedelta(minutes=6)
+      
+      data_hoje = agora.strftime("%Y-%m-%d")
+      hora_inicio = inicio.strftime("%H:%M")
+      hora_fim = fim.strftime("%H:%M")
+      
+      print(f"::set-output name=data::{data_hoje}")
+      print(f"::set-output name=hora_inicio::{hora_inicio}")
+      print(f"::set-output name=hora_fim::{hora_fim}")
+
+  - id: buscar_consultas
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/agendamentos/para-checkin"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+    queryParams:
+      data: "{{ outputs.calcular_janela.vars.data }}"
+      hora_inicio: "{{ outputs.calcular_janela.vars.hora_inicio }}"
+      hora_fim: "{{ outputs.calcular_janela.vars.hora_fim }}"
+      status: confirmado
+      checkin_enviado: "false"
+
+  # ----------------------------------------
+  # 2. Para cada consulta, envia check-in
+  # ----------------------------------------
+  - id: enviar_checkins
+    type: io.kestra.plugin.core.flow.EachSequential
+    value: "{{ outputs.buscar_consultas.body.data }}"
+    tasks:
+      # Envia mensagem com botões
+      - id: enviar_whatsapp
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+        method: POST
+        headers:
+          apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "number": "55{{ taskrun.value.paciente.telefone }}",
+            "text": "Olá, {{ taskrun.value.paciente.nome }}! 👋\n\nSua consulta começa em *5 minutos* ({{ taskrun.value.hora_inicio }}).\n\n📍 Você já chegou na clínica?\n\n✅ Responda *CHEGUEI* se já está aqui\n⏰ Responda *CAMINHO* se está chegando"
+          }
+
+      # Marca como enviado
+      - id: marcar_enviado
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/agendamentos/{{ taskrun.value.id }}"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "checkin_enviado": true,
+            "checkin_enviado_em": "{{ now() }}"
+          }
+
+      # Registra mensagem
+      - id: registrar
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/mensagens"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "clinica_id": "{{ taskrun.value.clinica_id }}",
+            "agendamento_id": "{{ taskrun.value.id }}",
+            "paciente_telefone": "{{ taskrun.value.paciente.telefone }}",
+            "tipo": "checkin_solicitacao",
+            "direcao": "enviada",
+            "status": "enviada"
+          }
+
+  # ----------------------------------------
+  # 3. Log de execução
+  # ----------------------------------------
+  - id: log
+    type: io.kestra.plugin.core.log.Log
+    message: "Check-ins enviados: {{ outputs.buscar_consultas.body.data | length }}"
+
+triggers:
+  # Executa a cada minuto das 7h às 21h
+  - id: cada_minuto
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "* 7-21 * * 1-6"  # Seg-Sab, 7h-21h
+    timezone: America/Sao_Paulo
+
+---
+# ============================================
+# WORKFLOW: Processar Check-in (resposta)
+# ============================================
+# Dispara quando paciente responde CHEGUEI/CAMINHO
+# Move card automaticamente no Kanban
+# ============================================
+
+id: processar-checkin
+namespace: clinica
+description: Processa resposta de check-in do paciente
+
+labels:
+  team: atendimento
+  module: checkin
+  priority: critical
+
+inputs:
+  - id: telefone
+    type: STRING
+    required: true
+    description: Telefone do paciente
+
+  - id: mensagem
+    type: STRING
+    required: true
+    description: Resposta do paciente
+
+  - id: message_id
+    type: STRING
+    required: true
+    description: ID da mensagem
+
+tasks:
+  # ----------------------------------------
+  # 1. Busca agendamento aguardando check-in
+  # ----------------------------------------
+  - id: buscar_agendamento
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/agendamentos/aguardando-checkin"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+    queryParams:
+      telefone: "{{ inputs.telefone }}"
+
+  # ----------------------------------------
+  # 2. Processa resposta
+  # ----------------------------------------
+  - id: processar_resposta
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    script: |
+      import json
+      
+      mensagem = "{{ inputs.mensagem }}".strip().upper()
+      agendamento_data = json.loads('''{{ outputs.buscar_agendamento.body | json }}''')
+      agendamento = agendamento_data.get("data", {})
+      
+      if not agendamento:
+          acao = "sem_agendamento"
+          resposta = "Não encontrei nenhuma consulta sua aguardando check-in. Se precisar de ajuda, é só chamar!"
+      elif mensagem in ["CHEGUEI", "CHEGEI", "JA CHEGUEI", "SIM", "AQUI", "1", "✅"]:
+          acao = "confirmar_chegada"
+          resposta = f"✅ Check-in confirmado!\n\nAguarde na recepção. O(a) Dr(a). {agendamento.get('medico', {}).get('nome', '')} será notificado(a).\n\nEm breve você será chamado(a)! 🙏"
+      elif mensagem in ["CAMINHO", "ESTOU INDO", "ATRASADO", "2", "⏰"]:
+          acao = "a_caminho"
+          resposta = "Ok! Avise quando chegar respondendo *CHEGUEI*.\n\n⚠️ Lembrando que atrasos podem impactar seu atendimento."
+      else:
+          acao = "nao_entendeu"
+          resposta = "Não entendi. Por favor responda:\n\n✅ *CHEGUEI* - se já está na clínica\n⏰ *CAMINHO* - se está chegando"
+      
+      print(f"::set-output name=acao::{acao}")
+      print(f"::set-output name=resposta::{resposta}")
+      print(f"::set-output name=agendamento_id::{agendamento.get('id', '')}")
+      print(f"::set-output name=card_id::{agendamento.get('card_id', '')}")
+      print(f"::set-output name=medico_id::{agendamento.get('medico', {}).get('id', '')}")
+      print(f"::set-output name=paciente_nome::{agendamento.get('paciente', {}).get('nome', '')}")
+
+  # ----------------------------------------
+  # 3. Se CHEGUEI: atualiza tudo
+  # ----------------------------------------
+  - id: acao_confirmar_chegada
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.processar_resposta.vars.acao == 'confirmar_chegada' }}"
+    then:
+      # Atualiza agendamento
+      - id: atualizar_agendamento
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/agendamentos/{{ outputs.processar_resposta.vars.agendamento_id }}"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "status": "aguardando",
+            "checkin_confirmado": true,
+            "checkin_confirmado_em": "{{ now() }}",
+            "checkin_via": "whatsapp"
+          }
+
+      # Atualiza checklist do card
+      - id: atualizar_checklist
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/cards/{{ outputs.processar_resposta.vars.card_id }}/checklist/checkin_confirmado"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "concluido": true,
+            "automatico": true,
+            "origem": "whatsapp"
+          }
+
+      # Move card para "Em Espera" (subfase da fase 2)
+      - id: mover_card
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/cards/{{ outputs.processar_resposta.vars.card_id }}/mover"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "fase": 2,
+            "subfase": "em_espera",
+            "automatico": true,
+            "motivo": "Check-in via WhatsApp"
+          }
+
+      # Notifica médico
+      - id: notificar_medico
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/notificacoes"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "user_id": "{{ outputs.processar_resposta.vars.medico_id }}",
+            "tipo": "paciente_chegou",
+            "titulo": "Paciente chegou",
+            "mensagem": "{{ outputs.processar_resposta.vars.paciente_nome }} fez check-in e está aguardando",
+            "referencia_tipo": "agendamento",
+            "referencia_id": "{{ outputs.processar_resposta.vars.agendamento_id }}",
+            "prioridade": "alta",
+            "som": true
+          }
+
+      # Notifica recepção (broadcast)
+      - id: notificar_recepcao
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/notificacoes/broadcast"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "perfil_filtro": ["recepcao"],
+            "tipo": "paciente_chegou",
+            "titulo": "Check-in automático",
+            "mensagem": "{{ outputs.processar_resposta.vars.paciente_nome }} confirmou chegada via WhatsApp",
+            "referencia_tipo": "card",
+            "referencia_id": "{{ outputs.processar_resposta.vars.card_id }}"
+          }
+
+  # ----------------------------------------
+  # 4. Envia resposta ao paciente
+  # ----------------------------------------
+  - id: enviar_resposta
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+    method: POST
+    headers:
+      apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "number": "55{{ inputs.telefone }}",
+        "text": "{{ outputs.processar_resposta.vars.resposta }}"
+      }
+
+  # ----------------------------------------
+  # 5. Registra mensagem
+  # ----------------------------------------
+  - id: registrar
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/mensagens"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "telefone": "{{ inputs.telefone }}",
+        "tipo": "checkin_resposta",
+        "direcao": "recebida",
+        "conteudo": "{{ inputs.mensagem }}",
+        "message_id": "{{ inputs.message_id }}",
+        "acao_executada": "{{ outputs.processar_resposta.vars.acao }}"
+      }
+
+triggers:
+  - id: webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "processar-checkin-trigger"

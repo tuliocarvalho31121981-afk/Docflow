@@ -1,0 +1,95 @@
+# ============================================
+# WORKFLOW: Pesquisa de Satisfação
+# ============================================
+# Executa diariamente às 19h
+# Envia pesquisa NPS para consultas do dia
+# ============================================
+
+id: pesquisa-satisfacao
+namespace: clinica
+description: Envia pesquisa de satisfação após consulta
+
+labels:
+  team: qualidade
+  module: nps
+  priority: low
+
+tasks:
+  # ----------------------------------------
+  # 1. Busca consultas finalizadas hoje
+  # ----------------------------------------
+  - id: buscar_consultas
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/consultas"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+    queryParams:
+      data: "{{ now() | dateFormat('yyyy-MM-dd') }}"
+      status: finalizada
+      pesquisa_enviada: "false"
+
+  # ----------------------------------------
+  # 2. Para cada, envia pesquisa
+  # ----------------------------------------
+  - id: enviar_pesquisas
+    type: io.kestra.plugin.core.flow.EachSequential
+    value: "{{ outputs.buscar_consultas.body.data }}"
+    tasks:
+      # Gera token da pesquisa
+      - id: gerar_token
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/pesquisa/token"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "consulta_id": "{{ taskrun.value.id }}",
+            "paciente_id": "{{ taskrun.value.paciente.id }}",
+            "medico_id": "{{ taskrun.value.medico.id }}",
+            "validade_dias": 7
+          }
+
+      # Envia WhatsApp
+      - id: enviar_whatsapp
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('EVOLUTION_API_URL') }}/message/sendText/{{ secret('EVOLUTION_INSTANCE') }}"
+        method: POST
+        headers:
+          apikey: "{{ secret('EVOLUTION_API_KEY') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "number": "55{{ taskrun.value.paciente.telefone }}",
+            "text": "Olá, {{ taskrun.value.paciente.nome }}! 😊\n\nEsperamos que seu atendimento tenha sido excelente!\n\nPoderia nos ajudar respondendo uma rápida pesquisa? Leva menos de 1 minuto:\n\n👉 {{ secret('FRONTEND_URL') }}/pesquisa/{{ outputs.gerar_token.body.data.token }}\n\nSua opinião é muito importante para nós!\n\nObrigado pela confiança. 💙"
+          }
+
+      # Marca como enviada
+      - id: marcar_enviada
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/consultas/{{ taskrun.value.id }}"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "pesquisa_enviada": true,
+            "pesquisa_enviada_em": "{{ now() }}"
+          }
+
+  # ----------------------------------------
+  # 3. Log de conclusão
+  # ----------------------------------------
+  - id: log_conclusao
+    type: io.kestra.plugin.core.log.Log
+    message: "Pesquisas de satisfação enviadas: {{ outputs.buscar_consultas.body.meta.total }}"
+
+triggers:
+  # Executa todos os dias às 19h
+  - id: diario_19h
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 19 * * *"
+    timezone: America/Sao_Paulo

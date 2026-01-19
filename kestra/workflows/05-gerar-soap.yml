@@ -1,0 +1,285 @@
+# ============================================
+# WORKFLOW: Gerar SOAP com IA
+# ============================================
+# Dispara após transcrição ou sob demanda
+# Usa Claude para estruturar SOAP
+# Sugere CIDs automaticamente
+# ============================================
+
+id: gerar-soap
+namespace: clinica
+description: Gera nota SOAP estruturada usando Claude
+
+labels:
+  team: prontuario
+  module: ia
+  priority: high
+
+inputs:
+  - id: consulta_id
+    type: STRING
+    required: true
+    description: ID da consulta
+
+  - id: clinica_id
+    type: STRING
+    required: true
+    description: ID da clínica
+
+  - id: medico_id
+    type: STRING
+    required: true
+    description: ID do médico
+
+  - id: paciente_id
+    type: STRING
+    required: true
+    description: ID do paciente
+
+  - id: instrucoes_adicionais
+    type: STRING
+    required: false
+    description: Instruções específicas do médico
+
+tasks:
+  # ----------------------------------------
+  # 1. Busca transcrição
+  # ----------------------------------------
+  - id: buscar_transcricao
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/consultas/{{ inputs.consulta_id }}/transcricao"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+
+  # ----------------------------------------
+  # 2. Busca dados completos do paciente
+  # ----------------------------------------
+  - id: buscar_paciente
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/pacientes/{{ inputs.paciente_id }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+
+  # ----------------------------------------
+  # 3. Busca anamnese (se houver)
+  # ----------------------------------------
+  - id: buscar_anamnese
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/consultas/{{ inputs.consulta_id }}/anamnese"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+    allowFailure: true
+
+  # ----------------------------------------
+  # 4. Monta prompt para Claude
+  # ----------------------------------------
+  - id: montar_prompt
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    script: |
+      import json
+      
+      paciente = json.loads('''{{ outputs.buscar_paciente.body | json }}''').get("data", {})
+      transcricao = json.loads('''{{ outputs.buscar_transcricao.body | json }}''').get("data", {})
+      
+      # Tenta pegar anamnese
+      try:
+          anamnese = json.loads('''{{ outputs.buscar_anamnese.body | json }}''').get("data", {})
+      except:
+          anamnese = {}
+      
+      instrucoes = "{{ inputs.instrucoes_adicionais }}" or ""
+      
+      # Monta contexto do paciente
+      context_parts = []
+      
+      context_parts.append(f"""
+      DADOS DO PACIENTE:
+      - Nome: {paciente.get('nome', 'N/A')}
+      - Idade: {paciente.get('idade', 'N/A')} anos
+      - Sexo: {paciente.get('sexo', 'N/A')}
+      - Tipo Sanguíneo: {paciente.get('tipo_sanguineo', 'N/A')}
+      """)
+      
+      # Alergias
+      alergias = paciente.get("alergias", [])
+      if alergias:
+          alergias_str = ", ".join([f"{a['substancia']} ({a['gravidade']})" for a in alergias])
+          context_parts.append(f"- ⚠️ ALERGIAS: {alergias_str}")
+      
+      # Medicamentos
+      meds = paciente.get("medicamentos", [])
+      if meds:
+          meds_str = ", ".join([f"{m['nome']} {m.get('dosagem', '')}" for m in meds])
+          context_parts.append(f"- Medicamentos em uso: {meds_str}")
+      
+      # Anamnese
+      if anamnese:
+          context_parts.append(f"""
+      ANAMNESE PRÉ-CONSULTA:
+      - Queixa principal: {anamnese.get('queixa_principal', 'N/A')}
+      - Duração: {anamnese.get('duracao_sintomas', 'N/A')}
+      - Intensidade (0-10): {anamnese.get('intensidade_dor', 'N/A')}
+      """)
+      
+      context = "\n".join(context_parts)
+      transcricao_texto = transcricao.get("texto", "")
+      
+      # Prompt completo para Claude
+      user_prompt = f"""{context}
+      
+      TRANSCRIÇÃO DA CONSULTA:
+      {transcricao_texto}
+      
+      {f'INSTRUÇÕES ADICIONAIS DO MÉDICO: {instrucoes}' if instrucoes else ''}
+      
+      Por favor, gere a nota SOAP em formato JSON seguindo a estrutura especificada.
+      """
+      
+      # Escapa para JSON
+      user_prompt_escaped = user_prompt.replace('"', '\\"').replace('\n', '\\n')
+      
+      print(f"::set-output name=user_prompt::{user_prompt_escaped}")
+
+  # ----------------------------------------
+  # 5. Chama Claude API
+  # ----------------------------------------
+  - id: chamar_claude
+    type: io.kestra.plugin.core.http.Request
+    uri: "https://api.anthropic.com/v1/messages"
+    method: POST
+    headers:
+      x-api-key: "{{ secret('ANTHROPIC_API_KEY') }}"
+      anthropic-version: "2023-06-01"
+      Content-Type: application/json
+    body: |
+      {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 4096,
+        "system": "Você é um assistente médico especializado em documentação clínica. Sua tarefa é analisar transcrições de consultas médicas e gerar notas no formato SOAP.\n\nREGRAS:\n1. Seja objetivo e use linguagem médica adequada\n2. Não invente informações que não estejam na transcrição\n3. Se algo não foi mencionado, indique como 'Não avaliado'\n4. Sugira CIDs baseados nas informações disponíveis\n\nFORMATO DE RESPOSTA (JSON):\n{\n  \"subjetivo\": \"Texto do S\",\n  \"objetivo\": \"Texto do O\",\n  \"avaliacao\": \"Texto do A\",\n  \"plano\": \"Texto do P\",\n  \"exame_fisico\": {\n    \"sinais_vitais\": {\n      \"pressao_arterial\": \"valor ou null\",\n      \"frequencia_cardiaca\": \"valor ou null\",\n      \"temperatura\": \"valor ou null\"\n    }\n  },\n  \"cids_sugeridos\": [\n    {\"codigo\": \"X00.0\", \"descricao\": \"Nome\", \"tipo\": \"principal\"}\n  ],\n  \"alertas\": [\"Lista de alertas, se houver\"],\n  \"confianca\": 0.85\n}",
+        "messages": [
+          {
+            "role": "user",
+            "content": "{{ outputs.montar_prompt.vars.user_prompt }}"
+          }
+        ]
+      }
+
+  # ----------------------------------------
+  # 6. Processa resposta do Claude
+  # ----------------------------------------
+  - id: processar_resposta
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    script: |
+      import json
+      import re
+      
+      response = json.loads('''{{ outputs.chamar_claude.body | json }}''')
+      
+      # Extrai texto da resposta
+      content = response.get("content", [{}])[0].get("text", "{}")
+      
+      # Remove marcadores de código se houver
+      if "```json" in content:
+          content = content.split("```json")[1].split("```")[0]
+      elif "```" in content:
+          content = content.split("```")[1].split("```")[0]
+      
+      # Parse do JSON
+      try:
+          soap = json.loads(content.strip())
+          soap["erro_parse"] = False
+      except:
+          soap = {
+              "subjetivo": content,
+              "objetivo": "",
+              "avaliacao": "",
+              "plano": "",
+              "cids_sugeridos": [],
+              "erro_parse": True
+          }
+      
+      soap["modelo"] = "claude-sonnet-4-20250514"
+      soap["gerado_por_ia"] = True
+      
+      # Output como JSON string
+      soap_json = json.dumps(soap, ensure_ascii=False)
+      print(f"::set-output name=soap::{soap_json}")
+
+  # ----------------------------------------
+  # 7. Salva SOAP no banco
+  # ----------------------------------------
+  - id: salvar_soap
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/consultas/{{ inputs.consulta_id }}/soap"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: "{{ outputs.processar_resposta.vars.soap }}"
+
+  # ----------------------------------------
+  # 8. Notifica médico
+  # ----------------------------------------
+  - id: notificar_medico
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/notificacoes"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "user_id": "{{ inputs.medico_id }}",
+        "tipo": "soap_gerado",
+        "titulo": "SOAP gerado",
+        "mensagem": "O SOAP foi gerado pela IA e está pronto para revisão",
+        "referencia_tipo": "consulta",
+        "referencia_id": "{{ inputs.consulta_id }}",
+        "acao_url": "/prontuario/consultas/{{ inputs.consulta_id }}/soap"
+      }
+
+  # ----------------------------------------
+  # 9. Callback
+  # ----------------------------------------
+  - id: callback
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/webhooks/kestra"
+    method: POST
+    headers:
+      X-Webhook-Secret: "{{ secret('WEBHOOK_SECRET') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "workflow": "gerar-soap",
+        "execution_id": "{{ execution.id }}",
+        "status": "SUCCESS",
+        "outputs": {
+          "consulta_id": "{{ inputs.consulta_id }}"
+        }
+      }
+
+errors:
+  - id: callback_erro
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/webhooks/kestra"
+    method: POST
+    headers:
+      X-Webhook-Secret: "{{ secret('WEBHOOK_SECRET') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "workflow": "gerar-soap",
+        "execution_id": "{{ execution.id }}",
+        "status": "FAILED",
+        "error": "{{ error.message }}"
+      }
+
+triggers:
+  - id: webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "gerar-soap-trigger"

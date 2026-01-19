@@ -1,0 +1,182 @@
+# ============================================
+# WORKFLOW: Alertas de Vencimento
+# ============================================
+# Executa diariamente às 8h
+# Alerta sobre contas vencendo/vencidas
+# Alerta sobre saldo mínimo
+# ============================================
+
+id: alertas-vencimento
+namespace: clinica
+description: Envia alertas diários sobre vencimentos e saldo
+
+labels:
+  team: financeiro
+  module: alertas
+  priority: high
+
+tasks:
+  # ----------------------------------------
+  # 1. Lista todas as clínicas ativas
+  # ----------------------------------------
+  - id: listar_clinicas
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/clinicas"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+    queryParams:
+      status: ativo
+
+  # ----------------------------------------
+  # 2. Para cada clínica, verifica alertas
+  # ----------------------------------------
+  - id: processar_clinicas
+    type: io.kestra.plugin.core.flow.EachSequential
+    value: "{{ outputs.listar_clinicas.body.data }}"
+    tasks:
+      # 2.1 Busca contas vencendo hoje
+      - id: contas_vencendo_hoje
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/contas-pagar"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+        queryParams:
+          clinica_id: "{{ taskrun.value.id }}"
+          data_vencimento: "{{ now() | dateFormat('yyyy-MM-dd') }}"
+          status: pendente,aprovado
+
+      # 2.2 Busca contas vencidas
+      - id: contas_vencidas
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/contas-pagar"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+        queryParams:
+          clinica_id: "{{ taskrun.value.id }}"
+          status: atrasado
+          limit: "50"
+
+      # 2.3 Busca saldo atual
+      - id: saldo_atual
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/financeiro/saldo"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+        queryParams:
+          clinica_id: "{{ taskrun.value.id }}"
+
+      # 2.4 Processa alertas
+      - id: processar_alertas
+        type: io.kestra.plugin.scripts.python.Script
+        runner: PROCESS
+        script: |
+          import json
+          
+          clinica = json.loads('''{{ taskrun.value | json }}''')
+          vencendo = json.loads('''{{ outputs.contas_vencendo_hoje.body | json }}''').get("data", [])
+          vencidas = json.loads('''{{ outputs.contas_vencidas.body | json }}''').get("data", [])
+          saldo_info = json.loads('''{{ outputs.saldo_atual.body | json }}''').get("data", {})
+          
+          alertas = []
+          
+          # Alerta de contas vencendo hoje
+          if vencendo:
+              total_hoje = sum(c["valor"] for c in vencendo)
+              alertas.append({
+                  "tipo": "vencimento_hoje",
+                  "titulo": f"⚠️ {len(vencendo)} conta(s) vencem hoje",
+                  "mensagem": f"Total a pagar hoje: R$ {total_hoje:,.2f}",
+                  "prioridade": "alta"
+              })
+          
+          # Alerta de contas vencidas
+          if vencidas:
+              total_vencido = sum(c["valor"] for c in vencidas)
+              alertas.append({
+                  "tipo": "contas_vencidas",
+                  "titulo": f"🔴 {len(vencidas)} conta(s) em atraso",
+                  "mensagem": f"Total em atraso: R$ {total_vencido:,.2f}",
+                  "prioridade": "critica"
+              })
+          
+          # Alerta de saldo mínimo
+          saldo = saldo_info.get("saldo_atual", 0)
+          saldo_minimo = clinica.get("saldo_minimo_alerta", 5000)
+          
+          if saldo < saldo_minimo:
+              alertas.append({
+                  "tipo": "saldo_baixo",
+                  "titulo": "💰 Saldo abaixo do mínimo",
+                  "mensagem": f"Saldo atual: R$ {saldo:,.2f} (mínimo: R$ {saldo_minimo:,.2f})",
+                  "prioridade": "alta"
+              })
+          
+          resultado = {
+              "clinica_id": clinica["id"],
+              "clinica_nome": clinica["nome"],
+              "total_alertas": len(alertas),
+              "alertas": alertas
+          }
+          
+          print(f"::set-output name=resultado::{json.dumps(resultado)}")
+
+      # 2.5 Envia alertas
+      - id: enviar_alertas
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.processar_alertas.vars.resultado | fromJson | attr('total_alertas') > 0 }}"
+        then:
+          - id: criar_alertas
+            type: io.kestra.plugin.core.flow.EachSequential
+            value: "{{ outputs.processar_alertas.vars.resultado | fromJson | attr('alertas') }}"
+            tasks:
+              - id: criar_alerta
+                type: io.kestra.plugin.core.http.Request
+                uri: "{{ secret('API_URL') }}/v1/internal/alertas"
+                method: POST
+                headers:
+                  Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+                  Content-Type: application/json
+                body: |
+                  {
+                    "clinica_id": "{{ outputs.processar_alertas.vars.resultado | fromJson | attr('clinica_id') }}",
+                    "tipo": "{{ taskrun.value.tipo }}",
+                    "titulo": "{{ taskrun.value.titulo }}",
+                    "mensagem": "{{ taskrun.value.mensagem }}",
+                    "prioridade": "{{ taskrun.value.prioridade }}"
+                  }
+
+          # Notifica admins
+          - id: notificar_admins
+            type: io.kestra.plugin.core.http.Request
+            uri: "{{ secret('API_URL') }}/v1/internal/notificacoes/broadcast"
+            method: POST
+            headers:
+              Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+              Content-Type: application/json
+            body: |
+              {
+                "clinica_id": "{{ outputs.processar_alertas.vars.resultado | fromJson | attr('clinica_id') }}",
+                "perfil_filtro": ["admin", "financeiro"],
+                "tipo": "alerta_financeiro",
+                "titulo": "Alertas financeiros",
+                "mensagem": "Há {{ outputs.processar_alertas.vars.resultado | fromJson | attr('total_alertas') }} alerta(s) que requerem atenção",
+                "acao_url": "/financeiro/alertas"
+              }
+
+  # ----------------------------------------
+  # 3. Log final
+  # ----------------------------------------
+  - id: log_final
+    type: io.kestra.plugin.core.log.Log
+    message: "Alertas de vencimento processados para {{ outputs.listar_clinicas.body.data | length }} clínicas"
+
+triggers:
+  # Executa todos os dias às 8h
+  - id: diario_8h
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 8 * * *"
+    timezone: America/Sao_Paulo

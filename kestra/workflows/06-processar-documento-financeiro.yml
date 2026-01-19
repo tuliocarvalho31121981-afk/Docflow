@@ -1,0 +1,254 @@
+# ============================================
+# WORKFLOW: Processar Documento Financeiro
+# ============================================
+# Dispara quando faz upload de NF/Boleto
+# OCR extrai texto → IA estrutura dados
+# Preenche conta a pagar automaticamente
+# ============================================
+
+id: processar-documento-financeiro
+namespace: clinica
+description: Processa NF/boleto com OCR e preenche conta a pagar
+
+labels:
+  team: financeiro
+  module: ia
+  priority: medium
+
+inputs:
+  - id: documento_id
+    type: STRING
+    required: true
+    description: ID do documento no banco
+
+  - id: storage_path
+    type: STRING
+    required: true
+    description: Path do arquivo no Storage
+
+  - id: tipo_documento
+    type: STRING
+    required: true
+    description: "Tipo: nota_fiscal, boleto, recibo"
+
+  - id: clinica_id
+    type: STRING
+    required: true
+    description: ID da clínica
+
+  - id: conta_pagar_id
+    type: STRING
+    required: false
+    description: ID da conta a pagar (se já existir)
+
+tasks:
+  # ----------------------------------------
+  # 1. Download do documento
+  # ----------------------------------------
+  - id: download_documento
+    type: io.kestra.plugin.core.http.Download
+    uri: "{{ secret('SUPABASE_URL') }}/storage/v1/object/authenticated/{{ inputs.storage_path }}"
+    headers:
+      Authorization: "Bearer {{ secret('SUPABASE_SERVICE_KEY') }}"
+
+  # ----------------------------------------
+  # 2. OCR com Google Vision
+  # ----------------------------------------
+  - id: ocr
+    type: io.kestra.plugin.core.http.Request
+    uri: "https://vision.googleapis.com/v1/images:annotate?key={{ secret('GOOGLE_VISION_API_KEY') }}"
+    method: POST
+    headers:
+      Content-Type: application/json
+    body: |
+      {
+        "requests": [
+          {
+            "image": {
+              "source": {
+                "imageUri": "{{ secret('SUPABASE_URL') }}/storage/v1/object/public/{{ inputs.storage_path }}"
+              }
+            },
+            "features": [
+              {"type": "TEXT_DETECTION"},
+              {"type": "DOCUMENT_TEXT_DETECTION"}
+            ]
+          }
+        ]
+      }
+
+  # ----------------------------------------
+  # 3. Extrai texto do OCR
+  # ----------------------------------------
+  - id: extrair_texto
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    script: |
+      import json
+      
+      response = json.loads('''{{ outputs.ocr.body | json }}''')
+      
+      # Extrai texto completo
+      texto = ""
+      if response.get("responses"):
+          annotations = response["responses"][0].get("textAnnotations", [])
+          if annotations:
+              texto = annotations[0].get("description", "")
+      
+      # Escapa para uso posterior
+      texto_escaped = texto.replace('"', '\\"').replace('\n', '\\n')
+      
+      print(f"::set-output name=texto::{texto_escaped}")
+
+  # ----------------------------------------
+  # 4. Busca fornecedores da clínica
+  # ----------------------------------------
+  - id: buscar_fornecedores
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/fornecedores"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+    queryParams:
+      clinica_id: "{{ inputs.clinica_id }}"
+      limit: "100"
+
+  # ----------------------------------------
+  # 5. Claude analisa e estrutura dados
+  # ----------------------------------------
+  - id: analisar_documento
+    type: io.kestra.plugin.core.http.Request
+    uri: "https://api.anthropic.com/v1/messages"
+    method: POST
+    headers:
+      x-api-key: "{{ secret('ANTHROPIC_API_KEY') }}"
+      anthropic-version: "2023-06-01"
+      Content-Type: application/json
+    body: |
+      {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 1024,
+        "system": "Você é um assistente especializado em análise de documentos fiscais brasileiros. Extraia informações estruturadas de notas fiscais, boletos e recibos.\n\nResposta em JSON:\n{\n  \"tipo_documento\": \"nota_fiscal|boleto|recibo\",\n  \"fornecedor\": {\n    \"nome\": \"Nome da empresa\",\n    \"cnpj\": \"XX.XXX.XXX/XXXX-XX\",\n    \"match_id\": \"UUID se encontrou match\"\n  },\n  \"valor\": 1234.56,\n  \"data_emissao\": \"YYYY-MM-DD\",\n  \"data_vencimento\": \"YYYY-MM-DD\",\n  \"numero_documento\": \"número da NF ou boleto\",\n  \"codigo_barras\": \"linha digitável se for boleto\",\n  \"descricao\": \"descrição resumida do documento\",\n  \"confianca\": 0.95\n}",
+        "messages": [
+          {
+            "role": "user",
+            "content": "TIPO DO DOCUMENTO: {{ inputs.tipo_documento }}\n\nFORNECEDORES CADASTRADOS:\n{{ outputs.buscar_fornecedores.body | json }}\n\nTEXTO EXTRAÍDO DO DOCUMENTO:\n{{ outputs.extrair_texto.vars.texto }}\n\nExtraia as informações e retorne em JSON."
+          }
+        ]
+      }
+
+  # ----------------------------------------
+  # 6. Processa resposta do Claude
+  # ----------------------------------------
+  - id: processar_analise
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    script: |
+      import json
+      import re
+      
+      response = json.loads('''{{ outputs.analisar_documento.body | json }}''')
+      content = response.get("content", [{}])[0].get("text", "{}")
+      
+      # Remove marcadores de código
+      if "```json" in content:
+          content = content.split("```json")[1].split("```")[0]
+      elif "```" in content:
+          content = content.split("```")[1].split("```")[0]
+      
+      try:
+          dados = json.loads(content.strip())
+      except:
+          dados = {"erro_parse": True, "texto_bruto": content}
+      
+      dados_json = json.dumps(dados, ensure_ascii=False)
+      print(f"::set-output name=dados::{dados_json}")
+
+  # ----------------------------------------
+  # 7. Atualiza ou cria conta a pagar
+  # ----------------------------------------
+  - id: atualizar_conta
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.conta_pagar_id != null and inputs.conta_pagar_id != '' }}"
+    then:
+      # Atualiza conta existente
+      - id: patch_conta
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/contas-pagar/{{ inputs.conta_pagar_id }}/dados-ia"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: "{{ outputs.processar_analise.vars.dados }}"
+    else:
+      # Cria nova conta
+      - id: criar_conta
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ secret('API_URL') }}/v1/internal/contas-pagar/from-documento"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+          Content-Type: application/json
+        body: |
+          {
+            "clinica_id": "{{ inputs.clinica_id }}",
+            "documento_id": "{{ inputs.documento_id }}",
+            "dados_extraidos": {{ outputs.processar_analise.vars.dados }}
+          }
+
+  # ----------------------------------------
+  # 8. Atualiza documento com dados extraídos
+  # ----------------------------------------
+  - id: atualizar_documento
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/documentos/{{ inputs.documento_id }}"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "ocr_texto": "{{ outputs.extrair_texto.vars.texto }}",
+        "dados_extraidos": {{ outputs.processar_analise.vars.dados }},
+        "processado": true,
+        "processado_em": "{{ now() }}"
+      }
+
+  # ----------------------------------------
+  # 9. Notifica usuário
+  # ----------------------------------------
+  - id: notificar
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/notificacoes/broadcast"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "clinica_id": "{{ inputs.clinica_id }}",
+        "perfil_filtro": ["admin", "financeiro"],
+        "tipo": "documento_processado",
+        "titulo": "Documento processado",
+        "mensagem": "NF/Boleto foi processado e conta a pagar preenchida automaticamente",
+        "acao_url": "/financeiro/contas-pagar"
+      }
+
+errors:
+  - id: marcar_erro
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/documentos/{{ inputs.documento_id }}"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "processado": true,
+        "erro_processamento": "{{ error.message }}"
+      }
+
+triggers:
+  - id: webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "processar-documento-financeiro-trigger"

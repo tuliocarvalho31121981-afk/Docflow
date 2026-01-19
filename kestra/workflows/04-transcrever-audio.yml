@@ -1,0 +1,231 @@
+# ============================================
+# WORKFLOW: Transcrição de Áudio
+# ============================================
+# Dispara quando médico envia áudio
+# Usa Whisper para transcrever
+# Salva resultado no banco
+# ============================================
+
+id: transcrever-audio
+namespace: clinica
+description: Transcreve áudio de consulta usando Whisper
+
+labels:
+  team: prontuario
+  module: ia
+  priority: high
+
+inputs:
+  - id: consulta_id
+    type: STRING
+    required: true
+    description: ID da consulta
+
+  - id: audio_storage_path
+    type: STRING
+    required: true
+    description: Path do áudio no Storage
+
+  - id: clinica_id
+    type: STRING
+    required: true
+    description: ID da clínica
+
+  - id: medico_id
+    type: STRING
+    required: true
+    description: ID do médico
+
+  - id: paciente_id
+    type: STRING
+    required: true
+    description: ID do paciente
+
+tasks:
+  # ----------------------------------------
+  # 1. Busca contexto do paciente
+  # ----------------------------------------
+  - id: buscar_contexto
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/pacientes/{{ inputs.paciente_id }}/contexto-ia"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+
+  # ----------------------------------------
+  # 2. Download do áudio do Storage
+  # ----------------------------------------
+  - id: download_audio
+    type: io.kestra.plugin.core.http.Download
+    uri: "{{ secret('SUPABASE_URL') }}/storage/v1/object/authenticated/{{ inputs.audio_storage_path }}"
+    headers:
+      Authorization: "Bearer {{ secret('SUPABASE_SERVICE_KEY') }}"
+
+  # ----------------------------------------
+  # 3. Prepara prompt contextualizado
+  # ----------------------------------------
+  - id: preparar_prompt
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    script: |
+      import json
+      
+      contexto = json.loads('''{{ outputs.buscar_contexto.body | json }}''')
+      
+      prompt_parts = [
+          "Transcrição de consulta médica em português brasileiro.",
+          "Estrutura SOAP: Subjetivo, Objetivo, Avaliação, Plano."
+      ]
+      
+      if contexto.get("queixa_principal"):
+          prompt_parts.append(f"Queixa principal: {contexto['queixa_principal']}")
+      
+      if contexto.get("medicamentos"):
+          meds = ", ".join(contexto["medicamentos"])
+          prompt_parts.append(f"Medicamentos em uso: {meds}")
+      
+      if contexto.get("alergias"):
+          alergias = ", ".join(contexto["alergias"])
+          prompt_parts.append(f"Alergias conhecidas: {alergias}")
+      
+      prompt = " ".join(prompt_parts)
+      print(f"::set-output name=prompt::{prompt}")
+
+  # ----------------------------------------
+  # 4. Chama Whisper API
+  # ----------------------------------------
+  - id: transcrever
+    type: io.kestra.plugin.core.http.Request
+    uri: "https://api.openai.com/v1/audio/transcriptions"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ secret('OPENAI_API_KEY') }}"
+    contentType: multipart/form-data
+    formData:
+      file: "{{ outputs.download_audio.uri }}"
+      model: whisper-1
+      language: pt
+      response_format: verbose_json
+      prompt: "{{ outputs.preparar_prompt.vars.prompt }}"
+
+  # ----------------------------------------
+  # 5. Processa resultado
+  # ----------------------------------------
+  - id: processar_resultado
+    type: io.kestra.plugin.scripts.python.Script
+    runner: PROCESS
+    script: |
+      import json
+      
+      resultado = json.loads('''{{ outputs.transcrever.body | json }}''')
+      
+      texto = resultado.get("text", "")
+      duracao = resultado.get("duration", 0)
+      
+      # Extrai segmentos para possível revisão
+      segmentos = []
+      for seg in resultado.get("segments", []):
+          segmentos.append({
+              "inicio": seg.get("start", 0),
+              "fim": seg.get("end", 0),
+              "texto": seg.get("text", "")
+          })
+      
+      print(f"::set-output name=texto::{texto}")
+      print(f"::set-output name=duracao::{duracao}")
+      print(f"::set-output name=segmentos::{json.dumps(segmentos)}")
+
+  # ----------------------------------------
+  # 6. Salva transcrição no banco
+  # ----------------------------------------
+  - id: salvar_transcricao
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/consultas/{{ inputs.consulta_id }}/transcricao"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "texto": "{{ outputs.processar_resultado.vars.texto }}",
+        "duracao_segundos": {{ outputs.processar_resultado.vars.duracao }},
+        "segmentos": {{ outputs.processar_resultado.vars.segmentos }},
+        "modelo": "whisper-1",
+        "status": "concluida"
+      }
+
+  # ----------------------------------------
+  # 7. Notifica médico
+  # ----------------------------------------
+  - id: notificar_medico
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/notificacoes"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "user_id": "{{ inputs.medico_id }}",
+        "tipo": "transcricao_pronta",
+        "titulo": "Transcrição concluída",
+        "mensagem": "A transcrição da consulta está pronta para revisão",
+        "referencia_tipo": "consulta",
+        "referencia_id": "{{ inputs.consulta_id }}",
+        "acao_url": "/prontuario/consultas/{{ inputs.consulta_id }}"
+      }
+
+  # ----------------------------------------
+  # 8. Callback para API
+  # ----------------------------------------
+  - id: callback
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/webhooks/kestra"
+    method: POST
+    headers:
+      X-Webhook-Secret: "{{ secret('WEBHOOK_SECRET') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "workflow": "transcrever-audio",
+        "execution_id": "{{ execution.id }}",
+        "status": "SUCCESS",
+        "outputs": {
+          "consulta_id": "{{ inputs.consulta_id }}",
+          "duracao_segundos": {{ outputs.processar_resultado.vars.duracao }}
+        }
+      }
+
+errors:
+  - id: marcar_erro
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/internal/consultas/{{ inputs.consulta_id }}/transcricao"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ secret('API_INTERNAL_TOKEN') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "status": "erro",
+        "erro_mensagem": "{{ error.message }}"
+      }
+
+  - id: callback_erro
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ secret('API_URL') }}/v1/webhooks/kestra"
+    method: POST
+    headers:
+      X-Webhook-Secret: "{{ secret('WEBHOOK_SECRET') }}"
+      Content-Type: application/json
+    body: |
+      {
+        "workflow": "transcrever-audio",
+        "execution_id": "{{ execution.id }}",
+        "status": "FAILED",
+        "error": "{{ error.message }}"
+      }
+
+triggers:
+  - id: webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "transcrever-audio-trigger"
