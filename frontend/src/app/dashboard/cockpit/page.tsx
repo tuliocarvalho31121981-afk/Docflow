@@ -58,9 +58,14 @@ export default function CockpitPage() {
     transcricao,
     setTranscricao,
     gravando,
+    processando: processandoTranscricao,
     tempoGravacao,
+    erro: erroTranscricao,
     toggleGravacao,
-  } = useTranscricao({ useMockData });
+  } = useTranscricao({
+    useMockData,
+    consultaId: consulta?.id,
+  });
 
   // Loading states
   const [loadingFila, setLoadingFila] = useState(true);
@@ -584,10 +589,16 @@ export default function CockpitPage() {
                         {Math.floor(tempoGravacao / 60).toString().padStart(2, '0')}:{(tempoGravacao % 60).toString().padStart(2, '0')}
                       </span>
                     )}
+                    {processandoTranscricao && (
+                      <span className="flex items-center gap-2 text-amber-400 text-sm">
+                        <RefreshCw className="w-4 h-4 animate-spin" />
+                        Transcrevendo...
+                      </span>
+                    )}
                   </div>
                   <button
                     onClick={toggleGravacao}
-                    disabled={!pacienteSelecionado}
+                    disabled={!pacienteSelecionado || processandoTranscricao}
                     className={cn(
                       'px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-all',
                       gravando
@@ -609,11 +620,35 @@ export default function CockpitPage() {
                     )}
                   </button>
                 </div>
+
+                {/* Erro de transcrição */}
+                {erroTranscricao && (
+                  <div className="mb-3 p-3 rounded-lg bg-red-500/20 border border-red-500/30">
+                    <p className="text-sm text-red-400">{erroTranscricao}</p>
+                  </div>
+                )}
+
+                {/* Indicador de modo */}
+                {!useMockData && !consulta && pacienteSelecionado && (
+                  <div className="mb-3 p-3 rounded-lg bg-amber-500/20 border border-amber-500/30">
+                    <p className="text-xs text-amber-400">
+                      ⚠️ Inicie uma consulta para habilitar transcrição automática via Whisper
+                    </p>
+                  </div>
+                )}
+
                 {transcricao ? (
                   <div className={cn('p-4 rounded-xl flex-1 overflow-y-auto min-h-0', glass.glassDark)}>
                     <pre className={cn('text-sm whitespace-pre-wrap font-sans', text.secondary)}>
                       {transcricao}
                     </pre>
+                  </div>
+                ) : processandoTranscricao ? (
+                  <div className={cn('p-8 rounded-xl text-center flex-1 flex flex-col items-center justify-center', glass.glassDark)}>
+                    <RefreshCw className={cn('w-12 h-12 mb-3 animate-spin', text.muted)} />
+                    <p className={cn('text-sm', text.muted)}>
+                      Processando áudio com Whisper...
+                    </p>
                   </div>
                 ) : (
                   <div className={cn('p-8 rounded-xl text-center flex-1 flex flex-col items-center justify-center', glass.glassDark)}>
@@ -623,6 +658,11 @@ export default function CockpitPage() {
                         ? 'Selecione um paciente'
                         : 'Clique em Gravar para iniciar'}
                     </p>
+                    {!useMockData && (
+                      <p className={cn('text-xs mt-2', text.muted)}>
+                        Modo: Whisper API (Groq)
+                      </p>
+                    )}
                   </div>
                 )}
               </div>
