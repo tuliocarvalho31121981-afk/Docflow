@@ -72,7 +72,7 @@ export default function SimuladorPage() {
   // Buscar config do LLM
   useEffect(() => {
     api.getLLMConfig()
-      .then(config => setLlmProvider(config.provider))
+      .then(config => setLlmProvider(config.llm_provider))
       .catch(() => setLlmProvider('não conectado'));
   }, []);
 

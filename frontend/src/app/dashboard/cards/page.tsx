@@ -18,7 +18,7 @@ import {
   Printer,
 } from 'lucide-react';
 import { ModeloSelector } from '@/components/modelos';
-import { api, type CardKanbanResponse, type CardResponse, type ChecklistItem as ApiChecklistItem } from '@/lib/api';
+import { api, type CardKanbanResponse, type ChecklistItem as ApiChecklistItem } from '@/lib/api';
 import { useAppStore } from '@/lib/store';
 import { cn, getGlassStyles, getTextStyles } from '@/lib/utils';
 
@@ -496,8 +496,8 @@ function CardModal({ cardId, onClose, onUpdated }: CardModalProps) {
         api.getCardChecklist(cardId).catch(() => []),
       ]);
 
-      // Adaptar tipos se necessário
-      setCard(cardData as CardResponse);
+      // Adaptar tipos se necessário (API retorna tipo diferente do local)
+      setCard(cardData as unknown as CardResponse);
       // O backend retorna ChecklistItem com item_key e ordem
       // O tipo do api.ts tem tipo e posicao, então fazemos o mapeamento
       setChecklist(checklistData.map(item => ({

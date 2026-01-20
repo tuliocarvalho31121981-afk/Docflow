@@ -111,9 +111,9 @@ export default function AgendaPage() {
       const dataStr = dataAtual.toISOString().split('T')[0];
 
       // Carrega médicos
-      const medicosData = await api.getMedicos();
+      const medicosData = await api.getMedicos() as { usuarios?: Medico[] } | Medico[];
       // ListaUsuariosResponse tem campo "usuarios", não é array direto
-      const medicosList = (medicosData?.usuarios || medicosData || []) as Medico[];
+      const medicosList = (Array.isArray(medicosData) ? medicosData : medicosData?.usuarios || []) as Medico[];
       // Garantir que todos os IDs sejam strings
       const medicosNormalizados = medicosList.map(medico => ({
         ...medico,
@@ -125,9 +125,11 @@ export default function AgendaPage() {
 
       // Carrega agendamentos
       const filters: any = { data: dataStr, per_page: 100 };
-      const agendamentosData = await api.getAgendamentos(filters);
+      const agendamentosData = await api.getAgendamentos(filters) as { items?: Agendamento[]; data?: Agendamento[] } | Agendamento[];
       // PaginatedResponse usa "items" não "data"
-      let agendamentosList = agendamentosData?.items || agendamentosData?.data || agendamentosData || [];
+      let agendamentosList = Array.isArray(agendamentosData)
+        ? agendamentosData
+        : (agendamentosData?.items || agendamentosData?.data || []);
 
       // Filtra no frontend se múltiplos médicos selecionados
       if (medicosSelecionados.length > 0) {
@@ -138,7 +140,7 @@ export default function AgendaPage() {
       setAgendamentos(agendamentosList);
 
       // Carrega métricas
-      const metricasData = await api.getMetricas(dataStr);
+      const metricasData = await api.getMetricas(dataStr) as Metricas | null;
       setMetricas(metricasData || null);
     } catch (err: any) {
       console.error('Erro ao carregar agenda:', err);

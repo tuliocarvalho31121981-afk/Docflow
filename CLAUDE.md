@@ -593,19 +593,52 @@ Cada seção editável abre um modal para alteração:
 - **Antecedentes**: Texto livre
 - **Anamnese**: Queixa principal + observações do médico
 
+### Estrutura de Arquivos (Refatorado - Sprint 6)
+
+```
+frontend/src/app/dashboard/cockpit/
+├── page.tsx                      # Página principal (790 linhas, orquestra tudo)
+├── types.ts                      # Interfaces TypeScript
+├── styles.ts                     # Estilos Liquid Glass compartilhados
+├── mocks.ts                      # Dados mock para desenvolvimento
+├── components/
+│   ├── index.ts                  # Exports centralizados
+│   ├── ColunaColapsavel.tsx      # Wrapper reutilizável com expansão lateral
+│   ├── PainelPreparado.tsx       # Coluna 2: Histórico + validações obrigatórias
+│   ├── PainelSOAP.tsx            # Coluna 3: Editor SOAP editável
+│   ├── PainelExameFisicoInferior.tsx  # Painel inferior: Sinais vitais
+│   ├── ModalEdicao.tsx           # Modal genérico para editar seções
+│   ├── ModalHistoricoConsulta.tsx # Modal para ver consulta anterior
+│   └── Toolbar.tsx               # Barra inferior: Receita, Atestado, etc
+└── hooks/
+    ├── index.ts                  # Exports centralizados
+    └── useTranscricao.ts         # Lógica de gravação de áudio
+```
+
 ### Componentes Principais
 
 | Componente | Arquivo | Função |
 |------------|---------|--------|
-| `ColunaColapsavel` | `cockpit/page.tsx` | Coluna com expansão lateral + tooltip |
-| `PainelExameFisicoInferior` | `cockpit/page.tsx` | Painel inferior com expansão vertical |
-| `PainelPreparado` | `cockpit/page.tsx` | Histórico + validações obrigatórias |
-| `PainelSOAP` | `cockpit/page.tsx` | Editor SOAP com campos editáveis |
-| `SecaoAnamnese` | `cockpit/page.tsx` | Anamnese com validação |
+| `ColunaColapsavel` | `components/ColunaColapsavel.tsx` | Wrapper com expansão lateral + tooltip |
+| `PainelPreparado` | `components/PainelPreparado.tsx` | Histórico + validações obrigatórias (Anamnese, Alergias, etc) |
+| `PainelSOAP` | `components/PainelSOAP.tsx` | Editor SOAP com campos editáveis (S, O, A, P) |
+| `PainelExameFisicoInferior` | `components/PainelExameFisicoInferior.tsx` | Sinais vitais com expansão vertical |
+| `ModalEdicao` | `components/ModalEdicao.tsx` | Modal genérico para edição de seções |
+| `ModalHistoricoConsulta` | `components/ModalHistoricoConsulta.tsx` | Visualização de consulta anterior |
+| `Toolbar` | `components/Toolbar.tsx` | Botões: Receita, Atestado, Exames, Finalizar |
+
+### Hooks Customizados
+
+| Hook | Arquivo | Função |
+|------|---------|--------|
+| `useTranscricao` | `hooks/useTranscricao.ts` | Gerencia gravação de áudio, timer, toggle |
+
+**Nota:** A Fila de Atendimento e Transcrição estão inline no `page.tsx` (não foram extraídos para componentes separados).
 
 ### Estados de Validação
 
 ```typescript
+// hooks/useCockpitState.ts
 const [validacoes, setValidacoes] = useState({
   anamnese: false,
   antecedentes: false,
