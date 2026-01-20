@@ -33,6 +33,7 @@ from app.cards.router import router as cards_router
 from app.evidencias.router import router as evidencias_router
 from app.prontuario.router import router as prontuario_router
 from app.modelos_documentos.router import router as modelos_documentos_router
+from app.cids.router import router as cids_router
 
 # Chat - ESCOLHA UMA DAS OPÇÕES ABAIXO:
 
@@ -184,6 +185,7 @@ app.include_router(cards_router, prefix="/v1")
 app.include_router(evidencias_router, prefix="/v1")
 app.include_router(prontuario_router, prefix="/v1")
 app.include_router(modelos_documentos_router, prefix="/v1")
+app.include_router(cids_router, prefix="/v1")
 
 # Chat (LangGraph)
 app.include_router(chat_router, prefix="/v1")
@@ -217,6 +219,7 @@ async def root():
             "cards": "/v1/cards",
             "prontuario": "/v1/prontuario",
             "modelos_documentos": "/v1/modelos-documentos",
+            "cids": "/v1/cids",
             "chat": "/v1/chat",
             "governanca": "/v1/governanca" if GOVERNANCA_DISPONIVEL else None
         }
