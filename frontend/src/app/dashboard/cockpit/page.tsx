@@ -348,14 +348,33 @@ export default function CockpitPage() {
 
   // Salvar sinais vitais
   const handleSalvarSinaisVitais = async () => {
-    if (!soap) return;
+    // Precisa de consulta para salvar
+    if (!consulta && !useMockData) {
+      console.warn('[Cockpit] Não é possível salvar sinais vitais sem consulta');
+      return;
+    }
 
     try {
       setSalvandoSinais(true);
-      if (!useMockData) {
-        await api.atualizarSOAP(soap.id, { exame_fisico: sinaisVitais });
+
+      if (!useMockData && consulta) {
+        if (soap) {
+          // SOAP existe - atualizar
+          await api.atualizarSOAP(soap.id, { exame_fisico: sinaisVitais });
+          setSoap(prev => prev ? { ...prev, exame_fisico: sinaisVitais } : null);
+        } else {
+          // SOAP não existe - criar
+          const novoSoap = await api.criarSOAP({
+            consulta_id: consulta.id,
+            exame_fisico: sinaisVitais,
+          });
+          setSoap(novoSoap);
+        }
+      } else {
+        // Modo demo - apenas atualiza localmente
+        setSoap(prev => prev ? { ...prev, exame_fisico: sinaisVitais } : null);
       }
-      setSoap(prev => prev ? { ...prev, exame_fisico: sinaisVitais } : null);
+
       setSinaisSalvos(true);
       setTimeout(() => setSinaisSalvos(false), 2000);
     } catch (error) {
