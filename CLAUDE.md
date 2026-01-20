@@ -621,30 +621,27 @@ const todasValidacoes = Object.values(validacoes).every(v => v);
 
 ## STATUS DO PROJETO
 
-### Sprints Concluídas (1-5)
+### Sprints Concluídas (1-6)
 - [x] Backend completo (auth, clínicas, pacientes, agenda, kanban, governança)
 - [x] Frontend com Design Liquid Glass
 - [x] Chat simulador com Groq API
 - [x] Sistema de cards/kanban
 - [x] Chat LangGraph implementado
 - [x] Ferramentas do agente
+- [x] Cockpit do Médico (layout, validações, modais)
 
-### Sprint Atual (6) - Cockpit do Médico
-- [x] Layout 4 colunas colapsáveis lateralmente
-- [x] Painel de Exame Físico com expansão vertical
-- [x] Ícone + tooltip quando coluna colapsada
-- [x] Histórico/SOAP/Transcrição expandem (flex-1)
-- [x] Sistema de validação obrigatória (Alergias, Anamnese, Medicamentos, Antecedentes)
-- [x] Botões Editar + Conferi em cada seção
-- [x] Modal de edição para cada seção
-- [x] Bloqueio do Finalizar se não validou tudo
-- [x] Barras de rolagem em todas as colunas
-- [ ] Integração API para salvar edições
-- [ ] Persistir validações no banco
+### Sprint Atual (8) - Transcrição de Consultas (Whisper)
+- [x] Endpoint `POST /prontuario/transcricoes/upload` - Upload de áudio
+- [x] Endpoint `POST /prontuario/transcricoes/audio-chunk` - Streaming de chunks
+- [x] Service com lógica de transcrição via Groq Whisper
+- [x] Config `groq_model_whisper = whisper-large-v3`
+- [x] Integração com GroqClient existente (GRÁTIS)
+- [ ] Integrar frontend cockpit com API de transcrição
+- [ ] Enviar áudio gravado para backend
+- [ ] Exibir transcrição em tempo real
 
 ### Próximas Sprints
 - Sprint 7: Integração WhatsApp real (Evolution API)
-- Sprint 8: Transcrição de consultas (Whisper)
 - Sprint 9: SOAP automático (Claude)
 
 ---

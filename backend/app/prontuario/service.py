@@ -1034,6 +1034,287 @@ class ProntuarioService:
 
         return historico
 
+    # ========================================================================
+    # TRANSCRIÇÃO DE ÁUDIO (WHISPER via Groq)
+    # ========================================================================
+
+    async def upload_and_transcribe(
+        self,
+        consulta_id: str,
+        audio_file,  # UploadFile
+        current_user: CurrentUser
+    ) -> TranscricaoResponse:
+        """
+        Faz upload do áudio e transcreve usando Whisper via Groq.
+
+        1. Lê o arquivo de áudio
+        2. Cria registro de transcrição (status=processando)
+        3. Envia para Groq Whisper
+        4. Atualiza registro com resultado
+        5. Retorna transcrição
+        """
+        from app.integracoes.groq.client import groq_client
+
+        logger.info(
+            "Iniciando transcrição",
+            consulta_id=consulta_id,
+            filename=audio_file.filename,
+            content_type=audio_file.content_type
+        )
+
+        db = get_authenticated_db(current_user.access_token)
+
+        # Verifica se consulta existe
+        consulta = await db.select_one(
+            table="consultas",
+            filters={"id": consulta_id}
+        )
+        if not consulta:
+            from app.core.exceptions import NotFoundError
+            raise NotFoundError("Consulta", consulta_id)
+
+        # Lê o conteúdo do áudio
+        audio_bytes = await audio_file.read()
+        audio_duracao = len(audio_bytes) // 16000  # Estimativa grosseira
+
+        logger.info(
+            "Áudio carregado",
+            size_bytes=len(audio_bytes),
+            duracao_estimada=audio_duracao
+        )
+
+        # Cria registro de transcrição
+        transcricao_data = {
+            "consulta_id": consulta_id,
+            "audio_duracao_segundos": audio_duracao,
+            "status": "processando",
+            "iniciada_em": datetime.now().isoformat(),
+            "modelo_whisper": "whisper-large-v3",
+            "idioma": "pt"
+        }
+
+        transcricao = await db.insert(
+            table="transcricoes",
+            data=transcricao_data
+        )
+
+        transcricao_id = transcricao["id"]
+        logger.info("Registro de transcrição criado", id=transcricao_id)
+
+        try:
+            # Transcreve usando Groq Whisper
+            texto_transcrito = await groq_client.transcribe(
+                audio_data=audio_bytes,
+                language="pt",
+                response_format="text"
+            )
+
+            logger.info(
+                "Transcrição concluída",
+                id=transcricao_id,
+                length=len(texto_transcrito)
+            )
+
+            # Atualiza registro com resultado
+            await db.update(
+                table="transcricoes",
+                data={
+                    "transcricao_bruta": texto_transcrito,
+                    "status": "concluida",
+                    "concluida_em": datetime.now().isoformat()
+                },
+                filters={"id": transcricao_id}
+            )
+
+            # Também atualiza a consulta com a transcrição
+            await db.update(
+                table="consultas",
+                data={
+                    "transcricao": texto_transcrito,
+                    "transcricao_processada": True
+                },
+                filters={"id": consulta_id}
+            )
+
+        except Exception as e:
+            logger.error(
+                "Erro na transcrição",
+                id=transcricao_id,
+                error=str(e)
+            )
+
+            # Atualiza registro com erro
+            await db.update(
+                table="transcricoes",
+                data={
+                    "status": "erro",
+                    "erro_mensagem": str(e),
+                    "concluida_em": datetime.now().isoformat()
+                },
+                filters={"id": transcricao_id}
+            )
+
+            raise
+
+        # Retorna transcrição atualizada
+        transcricao = await db.select_one(
+            table="transcricoes",
+            filters={"id": transcricao_id}
+        )
+
+        return TranscricaoResponse(**transcricao)
+
+    async def process_audio_chunk(
+        self,
+        consulta_id: str,
+        chunk_index: int,
+        is_final: bool,
+        audio_chunk,  # UploadFile
+        current_user: CurrentUser
+    ) -> dict:
+        """
+        Processa chunk de áudio para transcrição em tempo real.
+
+        Armazena chunks temporariamente e processa quando is_final=True.
+        """
+        from app.integracoes.groq.client import groq_client
+        import tempfile
+        import os
+
+        db = get_authenticated_db(current_user.access_token)
+
+        # Diretório para chunks temporários
+        temp_dir = tempfile.gettempdir()
+        chunk_dir = os.path.join(temp_dir, f"transcricao_{consulta_id}")
+        os.makedirs(chunk_dir, exist_ok=True)
+
+        # Salva o chunk
+        chunk_path = os.path.join(chunk_dir, f"chunk_{chunk_index:04d}.webm")
+        chunk_bytes = await audio_chunk.read()
+
+        with open(chunk_path, "wb") as f:
+            f.write(chunk_bytes)
+
+        logger.info(
+            "Chunk recebido",
+            consulta_id=consulta_id,
+            chunk_index=chunk_index,
+            is_final=is_final,
+            size=len(chunk_bytes)
+        )
+
+        if not is_final:
+            return {
+                "status": "chunk_received",
+                "chunk_index": chunk_index,
+                "consulta_id": consulta_id
+            }
+
+        # Se é final, junta todos os chunks e transcreve
+        logger.info("Processando chunks finais", consulta_id=consulta_id)
+
+        # Lista todos os chunks
+        chunks = sorted([
+            f for f in os.listdir(chunk_dir)
+            if f.startswith("chunk_")
+        ])
+
+        # Concatena todos os chunks
+        all_audio = b""
+        for chunk_file in chunks:
+            with open(os.path.join(chunk_dir, chunk_file), "rb") as f:
+                all_audio += f.read()
+
+        logger.info(
+            "Chunks concatenados",
+            total_chunks=len(chunks),
+            total_size=len(all_audio)
+        )
+
+        # Cria/atualiza registro de transcrição
+        existing = await db.select_one(
+            table="transcricoes",
+            filters={"consulta_id": consulta_id}
+        )
+
+        if existing:
+            transcricao_id = existing["id"]
+            await db.update(
+                table="transcricoes",
+                data={
+                    "status": "processando",
+                    "audio_duracao_segundos": len(all_audio) // 16000
+                },
+                filters={"id": transcricao_id}
+            )
+        else:
+            transcricao = await db.insert(
+                table="transcricoes",
+                data={
+                    "consulta_id": consulta_id,
+                    "audio_duracao_segundos": len(all_audio) // 16000,
+                    "status": "processando",
+                    "iniciada_em": datetime.now().isoformat(),
+                    "modelo_whisper": "whisper-large-v3",
+                    "idioma": "pt"
+                }
+            )
+            transcricao_id = transcricao["id"]
+
+        try:
+            # Transcreve
+            texto = await groq_client.transcribe(
+                audio_data=all_audio,
+                language="pt",
+                response_format="text"
+            )
+
+            # Atualiza registro
+            await db.update(
+                table="transcricoes",
+                data={
+                    "transcricao_bruta": texto,
+                    "status": "concluida",
+                    "concluida_em": datetime.now().isoformat()
+                },
+                filters={"id": transcricao_id}
+            )
+
+            # Atualiza consulta
+            await db.update(
+                table="consultas",
+                data={
+                    "transcricao": texto,
+                    "transcricao_processada": True
+                },
+                filters={"id": consulta_id}
+            )
+
+            # Limpa arquivos temporários
+            import shutil
+            shutil.rmtree(chunk_dir, ignore_errors=True)
+
+            return {
+                "status": "completed",
+                "consulta_id": consulta_id,
+                "transcricao_id": transcricao_id,
+                "transcricao": texto
+            }
+
+        except Exception as e:
+            logger.error("Erro na transcrição de chunks", error=str(e))
+
+            await db.update(
+                table="transcricoes",
+                data={
+                    "status": "erro",
+                    "erro_mensagem": str(e)
+                },
+                filters={"id": transcricao_id}
+            )
+
+            raise
+
 
 # Instância singleton
 prontuario_service = ProntuarioService()

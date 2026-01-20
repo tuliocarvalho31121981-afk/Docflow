@@ -12,7 +12,7 @@ from datetime import date
 from typing import Optional, List
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, status, UploadFile, File, HTTPException
 
 from app.core.schemas import PaginatedResponse, SuccessResponse
 from app.core.security import CurrentUser, require_permission
@@ -718,4 +718,62 @@ async def get_historico(
         paciente_id=str(paciente_id),
         current_user=current_user,
         limit=limit
+    )
+
+
+# ============================================================================
+# TRANSCRIÇÃO DE ÁUDIO (WHISPER)
+# ============================================================================
+
+@router.post(
+    "/transcricoes/upload",
+    response_model=TranscricaoResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Upload e Transcrição de Áudio",
+)
+async def upload_audio_transcricao(
+    consulta_id: UUID = Query(..., description="ID da consulta"),
+    audio_file: UploadFile = File(..., description="Arquivo de áudio"),
+    current_user: CurrentUser = Depends(require_permission("prontuario", "C"))
+):
+    """
+    Faz upload de áudio e transcreve usando Whisper (via Groq).
+
+    Formatos suportados: mp3, mp4, m4a, wav, webm, ogg, flac
+    Tamanho máximo: 25MB
+
+    O áudio é transcrito em tempo real e o resultado é salvo
+    na tabela de transcrições.
+    """
+    return await prontuario_service.upload_and_transcribe(
+        consulta_id=str(consulta_id),
+        audio_file=audio_file,
+        current_user=current_user
+    )
+
+
+@router.post(
+    "/transcricoes/audio-chunk",
+    response_model=dict,
+    summary="Enviar Chunk de Áudio (Streaming)",
+)
+async def upload_audio_chunk(
+    consulta_id: UUID = Query(..., description="ID da consulta"),
+    chunk_index: int = Query(..., description="Índice do chunk"),
+    is_final: bool = Query(default=False, description="Se é o último chunk"),
+    audio_chunk: UploadFile = File(..., description="Chunk de áudio"),
+    current_user: CurrentUser = Depends(require_permission("prontuario", "C"))
+):
+    """
+    Recebe chunks de áudio para transcrição em tempo real.
+
+    Use este endpoint para enviar áudio em pedaços durante a gravação.
+    Quando is_final=True, o sistema processa todos os chunks acumulados.
+    """
+    return await prontuario_service.process_audio_chunk(
+        consulta_id=str(consulta_id),
+        chunk_index=chunk_index,
+        is_final=is_final,
+        audio_chunk=audio_chunk,
+        current_user=current_user
     )

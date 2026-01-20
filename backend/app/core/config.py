@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     llm_provider: str = "groq"  # groq | deepseek | openai | openrouter
     groq_api_key: Optional[str] = None
     groq_model: str = "llama-3.1-70b-versatile"
+    groq_model_whisper: str = "whisper-large-v3"  # Modelo para transcrição de áudio
     deepseek_api_key: Optional[str] = None
     deepseek_model: str = "deepseek-chat"
     openai_api_key: Optional[str] = None
